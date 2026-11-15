@@ -1,0 +1,54 @@
+From d708bca062710d4dc4520d8d344cd1b314e0c5af Mon Sep 17 00:00:00 2001
+From: Ondrej Simon <ondrej@dorhawk.software>
+Date: Sun, 15 Nov 2026 12:13:52 +0100
+Subject: [PATCH] winemac.drv: Scale a cursor by its DPI only in Retina mode,
+ from 96 DPI.
+
+The cursor's points per pixel came from the system DPI as if Retina mode
+always meant 192 DPI: at 96 DPI, in Retina mode, a DPI-aware app's
+hourglass (32 pixels) was shown at 16 points, half the Mac pointer's
+size. A cursor loaded for a DPI now covers as many points as it would
+have pixels at 96 DPI, which is 32 for every DPI, and only in Retina
+mode; without it a pixel is a point, as for the app's windows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/mouse.c | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/winemac.drv/mouse.c b/dlls/winemac.drv/mouse.c
+index ac7268e9f2..d87d539b19 100644
+--- a/dlls/winemac.drv/mouse.c
++++ b/dlls/winemac.drv/mouse.c
+@@ -784,18 +784,20 @@ static BOOL get_icon_info(HICON handle, ICONINFOEXW *ret)
+  *              cursor_points_per_pixel
+  *
+  * A cursor loaded from a resource (Windows' own, or the app's) comes in the size for the DPI of
+- * the thread that loaded it: twice as big for a DPI-aware app in Retina mode. Shown at a point per
+- * pixel, it would be twice the size of the Mac's pointer, so it covers as many points as it would
+- * pixels at 96 DPI, as the app's windows do. A cursor an app makes from its own bitmaps, as games
+- * do, isn't sized for the DPI and keeps a point per pixel.
++ * the window's thread: 32 pixels at 96 DPI, 64 at 192. In Retina mode a pixel is half a point, and
++ * a cursor is shown at a point per pixel, as the Mac's own are, so one loaded for 192 DPI would be
++ * twice the Mac pointer's size: it covers as many points as it would have pixels at 96 DPI.
++ * Without Retina mode a pixel is a point, and the cursor keeps the scale the app's windows have.
++ * A cursor an app makes from its own bitmaps, as games do, isn't sized for the DPI and keeps a
++ * point per pixel.
+  */
+ static double cursor_points_per_pixel(HWND hwnd, const ICONINFOEXW *info)
+ {
+-    UINT system_dpi = NtUserGetSystemDpiForProcess(NULL), dpi = hwnd ? NtUserGetDpiForWindow(hwnd) : 0;
++    UINT dpi;
+ 
+-    if (!info->szModName[0] || !system_dpi) return 1;
+-    if (!dpi) dpi = system_dpi;
+-    return (retina_on ? 0.5 : 1) * system_dpi / dpi;
++    if (!info->szModName[0] || !retina_on) return 1;
++    if (!hwnd || !(dpi = NtUserGetDpiForWindow(hwnd))) dpi = NtUserGetSystemDpiForProcess(NULL);
++    return dpi ? 96.0 / dpi : 1;
+ }
+ 
+ 
+-- 
+2.56.1
+
