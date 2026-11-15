@@ -1,0 +1,1255 @@
+From f32d3d6df5c47e1483737d55532ca40ab5d97a4d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Sun, 15 Nov 2026 18:39:48 +0100
+Subject: [PATCH 65/65] win32u: Add GDI scaling, Windows' "System (Enhanced)".
+
+A program that isn't DPI aware is drawn at 96 DPI; on a display with more pixels Windows can
+stretch the result (blurry) or, with "System (Enhanced)", have GDI draw it at the display's DPI
+while the program keeps its own coordinates: text, lines and shapes come out sharp, bitmaps are
+enlarged. This adds the latter, on with the GDIDPISCALING compatibility layer (Windows writes
+"~ GDIDPISCALING DPIUNAWARE") or WINE_GDI_SCALING=1.
+
+A window DC of a scaled window draws into the window's surface at its display's DPI: the DC's
+world-to-device transform ends with the scale, fonts are realized at the display's size (bitmap
+fonts in whole multiples, their glyphs' pixels repeated), regions and clipping are mapped, and
+what the program reads back (LPtoDP, GetTransform, clip boxes, regions, pixels, compatible
+bitmaps and their bits) is in its own coordinates. A bitmap compatible with such a DC has the
+display's pixels. A stretch the program didn't ask for is smoothed. Layered windows aren't scaled.
+A window that moves to a display of another DPI is drawn again.
+
+Text drawn in 1x pixels (on a display that isn't a Retina one, scaled or not) is rendered for an
+LCD's subpixels, as ClearType does on such a display: grey smoothing keeps to the fonts' gasp
+tables, which ask Tahoma and Segoe UI at menu sizes for none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/win32u/bitblt.c          |   8 +-
+ dlls/win32u/bitmap.c          | 149 +++++++++++++++++++++++++++++++++-
+ dlls/win32u/clipping.c        |  82 ++++++++++++++++++-
+ dlls/win32u/dc.c              |  37 +++++++++
+ dlls/win32u/dce.c             |  53 +++++++++++-
+ dlls/win32u/dib.c             |  72 ++++++++++++++++
+ dlls/win32u/dibdrv/graphics.c |  18 ++++
+ dlls/win32u/dibdrv/objects.c  | 108 ++++++++++++++++++++++++
+ dlls/win32u/font.c            |  58 ++++++++++---
+ dlls/win32u/freetype.c        |  49 +++++++++++
+ dlls/win32u/mapping.c         |  20 +++--
+ dlls/win32u/ntgdi_private.h   |  19 +++++
+ dlls/win32u/sysparams.c       |   4 +
+ dlls/win32u/win32u_private.h  |   2 +
+ dlls/win32u/window.c          |   5 +-
+ 15 files changed, 657 insertions(+), 27 deletions(-)
+
+diff --git a/dlls/win32u/bitblt.c b/dlls/win32u/bitblt.c
+index c6021dde98..70e70a69d8 100644
+--- a/dlls/win32u/bitblt.c
++++ b/dlls/win32u/bitblt.c
+@@ -316,8 +316,14 @@ BOOL nulldrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
+     if (err == ERROR_TRANSFORM_NOT_SUPPORTED &&
+         ((src->width != dst->width) || (src->height != dst->height)))
+     {
++        int mode = dc_dst->attr->stretch_blt_mode;
++
+         copy_bitmapinfo( src_info, dst_info );
+-        err = stretch_bits( src_info, src, dst_info, dst, &bits, dc_dst->attr->stretch_blt_mode );
++        /* GDI scaling: a stretch the program didn't ask for (a blit into a DC drawn smaller
++         * than the program's pixels) is smoothed, rather than ANDing pixels together */
++        if ((dc_is_scaled( dc_dst ) && dc_scale( dc_dst ) < 1) || (dc_is_scaled( dc_src ) && dc_scale( dc_src ) > 1))
++            if (mode == BLACKONWHITE || mode == WHITEONBLACK) mode = HALFTONE;
++        err = stretch_bits( src_info, src, dst_info, dst, &bits, mode );
+         if (!err) err = dst_dev->funcs->pPutImage( dst_dev, 0, dst_info, &bits, src, dst, rop );
+     }
+ 
+diff --git a/dlls/win32u/bitmap.c b/dlls/win32u/bitmap.c
+index 8f961600b2..97b5cf9f7c 100644
+--- a/dlls/win32u/bitmap.c
++++ b/dlls/win32u/bitmap.c
+@@ -48,6 +48,84 @@ static const struct gdi_obj_funcs bitmap_funcs =
+ };
+ 
+ 
++
++/***********************************************************************
++ *           GDI scaling: bitmaps compatible with a scaled DC
++ *
++ * A bitmap a program makes compatible with a scaled DC has the DC's pixel density: a program
++ * that draws off screen first and then copies to its window gets as sharp a result as it would
++ * drawing to the window. The program sees the size it asked for; its bits are read and written
++ * through a copy at that size.
++ */
++static HBITMAP create_scaled_bitmap( INT width, INT height, UINT planes, UINT bpp,
++                                     struct ratio from, struct ratio to )
++{
++    RECT rect = {0, 0, abs( width ), abs( height )};
++    BITMAPOBJ *bmp;
++    HBITMAP ret;
++
++    rect = map_dpi_rect( rect, from, to );
++    if (!(ret = NtGdiCreateBitmap( max( 1, rect.right ), max( 1, rect.bottom ), planes, bpp, NULL ))) return 0;
++    if ((bmp = GDI_GetObjPtr( ret, NTGDI_OBJ_BITMAP )))
++    {
++        bmp->scale_from = from;
++        bmp->scale_to = to;
++        bmp->program_size.cx = abs( width );
++        bmp->program_size.cy = abs( height );
++        GDI_ReleaseObj( ret );
++    }
++    return ret;
++}
++
++BOOL is_scaled_bitmap( HBITMAP hbitmap )
++{
++    BITMAPOBJ *bmp = GDI_GetObjPtr( hbitmap, NTGDI_OBJ_BITMAP );
++    BOOL ret;
++
++    if (!bmp) return FALSE;
++    ret = bmp->scale_from.num != 0;
++    GDI_ReleaseObj( hbitmap );
++    return ret;
++}
++
++/* copies a bitmap into another the program's size, scaled or not, through two memory DCs */
++BOOL copy_bitmap_scaled( HBITMAP src, HBITMAP dst )
++{
++    BITMAP bm;
++    HDC hdc_src, hdc_dst;
++    BOOL ret = FALSE;
++
++    if (!NtGdiExtGetObjectW( dst, sizeof(bm), &bm )) return FALSE;
++    hdc_src = NtGdiCreateCompatibleDC( 0 );
++    hdc_dst = NtGdiCreateCompatibleDC( 0 );
++    if (NtGdiSelectBitmap( hdc_src, src ) && NtGdiSelectBitmap( hdc_dst, dst ))
++    {
++        set_stretch_blt_mode( hdc_dst, HALFTONE );
++        ret = NtGdiStretchBlt( hdc_dst, 0, 0, bm.bmWidth, bm.bmHeight,
++                               hdc_src, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY, 0 );
++    }
++    NtGdiDeleteObjectApp( hdc_src );
++    NtGdiDeleteObjectApp( hdc_dst );
++    return ret;
++}
++
++/* a plain bitmap of the program's size with a scaled bitmap's picture */
++HBITMAP unscaled_bitmap_copy( HBITMAP hbitmap )
++{
++    BITMAP bm;
++    HBITMAP ret;
++
++    if (!NtGdiExtGetObjectW( hbitmap, sizeof(bm), &bm )) return 0;
++    if (!(ret = NtGdiCreateBitmap( bm.bmWidth, bm.bmHeight, bm.bmPlanes, bm.bmBitsPixel, NULL ))) return 0;
++    if (!copy_bitmap_scaled( hbitmap, ret ))
++    {
++        WARN( "can't copy %p, it may be selected in a DC\n", hbitmap );
++        NtGdiDeleteObjectApp( ret );
++        return 0;
++    }
++    return ret;
++}
++
+ /******************************************************************************
+  *           NtGdiCreateCompatibleBitmap    (win32u.@)
+  *
+@@ -64,6 +142,28 @@ HBITMAP WINAPI NtGdiCreateCompatibleBitmap( HDC hdc, INT width, INT height )
+ 
+     if (!width || !height) return 0;
+ 
++    if (gdi_scaling)
++    {
++        DC *dc = get_dc_ptr( hdc );
++        struct ratio from = {0}, to = {0};
++        int bits = 0;
++
++        if (dc)
++        {
++            if (dc_is_scaled( dc )) { from = dc->scale_from; to = dc->scale_to; }
++            release_dc_ptr( dc );
++        }
++        if (from.num)
++        {
++            if (get_gdi_object_type( hdc ) != NTGDI_OBJ_MEMDC)
++                bits = NtGdiGetDeviceCaps( hdc, BITSPIXEL );
++            else if (NtGdiExtGetObjectW( NtGdiGetDCObject( hdc, NTGDI_OBJ_SURF ), sizeof(dib), &dib ) == sizeof(BITMAP))
++                bits = dib.dsBm.bmBitsPixel;
++            if (bits == 16 || bits == 8) bits = 32;  /* emulated, as below */
++            if (bits) return create_scaled_bitmap( width, height, 1, bits, from, to );
++        }
++    }
++
+     bpp = NtGdiGetDeviceCaps( hdc, BITSPIXEL );
+     /* 8-bit and 16-bit display modes are emulated */
+     if (NtGdiGetDeviceCaps( hdc, TECHNOLOGY ) == DT_RASDISPLAY && (bpp == 8 || bpp == 16))
+@@ -228,7 +328,24 @@ HBITMAP WINAPI NtGdiCreateBitmap( INT width, INT height, UINT planes,
+  *    Success: Number of bytes copied
+  *    Failure: 0
+  */
+-LONG WINAPI NtGdiGetBitmapBits(
++static LONG get_bitmap_bits( HBITMAP hbitmap, LONG count, LPVOID bits );
++
++LONG WINAPI NtGdiGetBitmapBits( HBITMAP hbitmap, LONG count, LPVOID bits )
++{
++    /* GDI scaling: a scaled bitmap's bits at the size the program asked for */
++    if (is_scaled_bitmap( hbitmap ))
++    {
++        HBITMAP copy = unscaled_bitmap_copy( hbitmap );
++        LONG ret;
++        if (!copy) return 0;
++        ret = get_bitmap_bits( copy, count, bits );
++        NtGdiDeleteObjectApp( copy );
++        return ret;
++    }
++    return get_bitmap_bits( hbitmap, count, bits );
++}
++
++static LONG get_bitmap_bits(
+     HBITMAP hbitmap, /* [in]  Handle to bitmap */
+     LONG count,        /* [in]  Number of bytes to copy */
+     LPVOID bits)       /* [out] Pointer to buffer to receive bits */
+@@ -297,7 +414,24 @@ done:
+  *    Success: Number of bytes used in setting the bitmap bits
+  *    Failure: 0
+  */
+-LONG WINAPI NtGdiSetBitmapBits(
++static LONG set_bitmap_bits( HBITMAP hbitmap, LONG count, LPCVOID bits );
++
++LONG WINAPI NtGdiSetBitmapBits( HBITMAP hbitmap, LONG count, LPCVOID bits )
++{
++    /* GDI scaling: the program's bits, at its size, scaled into the bitmap */
++    if (is_scaled_bitmap( hbitmap ))
++    {
++        HBITMAP copy = unscaled_bitmap_copy( hbitmap );
++        LONG ret;
++        if (!copy) return 0;
++        if ((ret = set_bitmap_bits( copy, count, bits ))) copy_bitmap_scaled( copy, hbitmap );
++        NtGdiDeleteObjectApp( copy );
++        return ret;
++    }
++    return set_bitmap_bits( hbitmap, count, bits );
++}
++
++static LONG set_bitmap_bits(
+     HBITMAP hbitmap, /* [in] Handle to bitmap */
+     LONG count,        /* [in] Number of bytes in bitmap array */
+     LPCVOID bits)      /* [in] Address of array with bitmap bits */
+@@ -467,7 +601,11 @@ HGDIOBJ WINAPI NtGdiSelectBitmap( HDC hdc, HGDIOBJ handle )
+         dc->attr->vis_rect.right  = bitmap->dib.dsBm.bmWidth;
+         dc->attr->vis_rect.bottom = bitmap->dib.dsBm.bmHeight;
+         dc->device_rect = dc->attr->vis_rect;
++        /* GDI scaling: a DC draws into a scaled bitmap at the bitmap's pixel density */
++        dc->scale_from = bitmap->scale_from;
++        dc->scale_to = bitmap->scale_to;
+         GDI_ReleaseObj( handle );
++        DC_UpdateXforms( dc );
+         DC_InitDC( dc );
+         GDI_dec_ref_count( ret );
+     }
+@@ -509,6 +647,13 @@ static INT BITMAP_GetObject( HGDIOBJ handle, INT count, LPVOID buffer )
+         BITMAP *bitmap = buffer;
+         *bitmap = bmp->dib.dsBm;
+         bitmap->bmBits = NULL;
++        if (bmp->scale_from.num)
++        {
++            /* GDI scaling: the size the program asked for */
++            bitmap->bmWidth = bmp->program_size.cx;
++            bitmap->bmHeight = bmp->program_size.cy;
++            bitmap->bmWidthBytes = get_bitmap_stride( bitmap->bmWidth, bitmap->bmBitsPixel );
++        }
+         ret = sizeof(BITMAP);
+     }
+     GDI_ReleaseObj( handle );
+diff --git a/dlls/win32u/clipping.c b/dlls/win32u/clipping.c
+index 60e8ee6ba1..c2e2ab5e3e 100644
+--- a/dlls/win32u/clipping.c
++++ b/dlls/win32u/clipping.c
+@@ -92,6 +92,18 @@ BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src )
+     return TRUE;
+ }
+ 
++/***********************************************************************
++ *           dc_scale_region
++ *
++ * GDI scaling: a new region with a scaled DC's region in the display's pixels (to_device)
++ * or in the program's own device coordinates.
++ */
++HRGN dc_scale_region( const DC *dc, HRGN hrgn, BOOL to_device )
++{
++    if (to_device) return map_dpi_region( hrgn, dc->scale_from, dc->scale_to );
++    return map_dpi_region( hrgn, dc->scale_to, dc->scale_from );
++}
++
+ /***********************************************************************
+  *           update_dc_clipping
+  *
+@@ -181,10 +193,19 @@ INT WINAPI NtGdiExtSelectClipRgn( HDC hdc, HRGN rgn, INT mode )
+                 release_dc_ptr( dc );
+                 return ERROR;
+             }
+-            mirror_region( mirrored, rgn, dc->attr->vis_rect.right - dc->attr->vis_rect.left );
++            mirror_region( mirrored, rgn, dc_is_scaled( dc ) ?
++                           GDI_ROUND( (dc->attr->vis_rect.right - dc->attr->vis_rect.left) / dc_scale( dc ) ) :
++                           dc->attr->vis_rect.right - dc->attr->vis_rect.left );
+             rgn = mirrored;
+         }
+ 
++        if (dc_is_scaled( dc ))
++        {
++            HRGN scaled = dc_scale_region( dc, rgn, TRUE );
++            if (mirrored) NtGdiDeleteObjectApp( mirrored );
++            rgn = mirrored = scaled;
++        }
++
+         if (!dc->hClipRgn)
+             create_default_clip_region( dc );
+ 
+@@ -206,6 +227,21 @@ INT WINAPI NtGdiExtSelectClipRgn( HDC hdc, HRGN rgn, INT mode )
+ void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
+                          struct window_surface *surface )
+ {
++    static const struct ratio none;
++    set_visible_region_scaled( hdc, hrgn, vis_rect, device_rect, surface, none, none );
++}
++
++/***********************************************************************
++ *           set_visible_region_scaled
++ *
++ * GDI scaling: with a DPI in from, the DC draws into a surface in pixels of the DPI in to,
++ * while the program keeps its own coordinates. The visible rect keeps its origin on the
++ * screen (GetDCOrgEx) and takes its size in the surface's pixels.
++ */
++void set_visible_region_scaled( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
++                                struct window_surface *surface, struct ratio from, struct ratio to )
++{
++    RECT vis = *vis_rect, device = *device_rect;
+     DC * dc;
+ 
+     if (!(dc = get_dc_ptr( hdc ))) return;
+@@ -216,10 +252,32 @@ void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *d
+     /* map region to DC coordinates */
+     NtGdiOffsetRgn( hrgn, -vis_rect->left, -vis_rect->top );
+ 
++    if (from.num)
++    {
++        RECT size = {0, 0, vis.right - vis.left, vis.bottom - vis.top};
++        RECT offset = {device.left - vis.left, device.top - vis.top,
++                       device.right - vis.left, device.bottom - vis.top};
++        HRGN scaled;
++
++        size = map_dpi_rect( size, from, to );
++        offset = map_dpi_rect( offset, from, to );
++        vis.right = vis.left + size.right;
++        vis.bottom = vis.top + size.bottom;
++        SetRect( &device, vis.left + offset.left, vis.top + offset.top,
++                 vis.left + offset.right, vis.top + offset.bottom );
++        if (hrgn && (scaled = map_dpi_region( hrgn, from, to )))
++        {
++            NtGdiDeleteObjectApp( hrgn );
++            hrgn = scaled;
++        }
++    }
++
+     if (dc->hVisRgn) NtGdiDeleteObjectApp( dc->hVisRgn );
+     dc->dirty = 0;
+-    dc->attr->vis_rect = *vis_rect;
+-    dc->device_rect = *device_rect;
++    dc->attr->vis_rect = vis;
++    dc->device_rect = device;
++    dc->scale_from = from;
++    dc->scale_to = to;
+     dc->hVisRgn = hrgn;
+     dibdrv_set_window_surface( dc, surface );
+     DC_UpdateXforms( dc );
+@@ -244,6 +302,11 @@ INT WINAPI NtGdiOffsetClipRgn( HDC hdc, INT x, INT y )
+         x = muldiv( x, dc->attr->vport_ext.cx, dc->attr->wnd_ext.cx );
+         y = muldiv( y, dc->attr->vport_ext.cy, dc->attr->wnd_ext.cy );
+         if (dc->attr->layout & LAYOUT_RTL) x = -x;
++        if (dc_is_scaled( dc ))
++        {
++            x = GDI_ROUND( x * dc_scale( dc ) );
++            y = GDI_ROUND( y * dc_scale( dc ) );
++        }
+         ret = NtGdiOffsetRgn( dc->hClipRgn, x, y );
+         update_dc_clipping( dc );
+     }
+@@ -438,6 +501,12 @@ INT WINAPI NtGdiGetRandomRgn( HDC hDC, HRGN hRgn, INT iCode )
+         if (dc->hVisRgn)
+         {
+             NtGdiCombineRgn( hRgn, dc->hVisRgn, 0, RGN_COPY );
++            if (dc_is_scaled( dc ))
++            {
++                HRGN unscaled = dc_scale_region( dc, hRgn, FALSE );
++                NtGdiCombineRgn( hRgn, unscaled, 0, RGN_COPY );
++                NtGdiDeleteObjectApp( unscaled );
++            }
+             /* On Windows NT/2000, the SYSRGN returned is in screen coordinates */
+             if (RtlGetCurrentPeb()->OSPlatformId != VER_PLATFORM_WIN32s)
+                 NtGdiOffsetRgn( hRgn, dc->attr->vis_rect.left, dc->attr->vis_rect.top );
+@@ -458,6 +527,13 @@ INT WINAPI NtGdiGetRandomRgn( HDC hDC, HRGN hRgn, INT iCode )
+     if (ret > 0 && (iCode & NTGDI_RGN_MIRROR_RTL) && (dc->attr->layout & LAYOUT_RTL))
+         mirror_region( hRgn, hRgn, dc->attr->vis_rect.right - dc->attr->vis_rect.left );
+ 
++    if (ret > 0 && dc_is_scaled( dc ) && (iCode & ~(NTGDI_RGN_MIRROR_RTL | NTGDI_RGN_MONITOR_DPI)) != SYSRGN)
++    {
++        HRGN unscaled = dc_scale_region( dc, hRgn, FALSE );
++        NtGdiCombineRgn( hRgn, unscaled, 0, RGN_COPY );
++        NtGdiDeleteObjectApp( unscaled );
++    }
++
+     release_dc_ptr( dc );
+ 
+     if (ret > 0 && (iCode & NTGDI_RGN_MONITOR_DPI))
+diff --git a/dlls/win32u/dc.c b/dlls/win32u/dc.c
+index a866869482..c06f79eb07 100644
+--- a/dlls/win32u/dc.c
++++ b/dlls/win32u/dc.c
+@@ -148,6 +148,30 @@ static void free_dc_attr( DC_ATTR *dc_attr )
+ }
+ 
+ 
++/***********************************************************************
++ *           apply_device_scale
++ *
++ * GDI scaling: a scaled window DC draws in its display's pixels. Its world-to-device
++ * transform ends with the scale, so everything drawn, fonts too, is drawn at the display's
++ * DPI; what the program reads back is taken out of it again (see NtGdiTransformPoints).
++ */
++static BOOL DC_InvertXform( const XFORM *xformSrc, XFORM *xformDest );
++
++static void apply_device_scale( DC *dc )
++{
++    double scale;
++
++    if (!dc_is_scaled( dc )) return;
++    scale = dc_scale( dc );
++    dc->xformWorld2Vport.eM11 *= scale;
++    dc->xformWorld2Vport.eM12 *= scale;
++    dc->xformWorld2Vport.eM21 *= scale;
++    dc->xformWorld2Vport.eM22 *= scale;
++    dc->xformWorld2Vport.eDx  *= scale;
++    dc->xformWorld2Vport.eDy  *= scale;
++    dc->vport2WorldValid = DC_InvertXform( &dc->xformWorld2Vport, &dc->xformVport2World );
++}
++
+ /***********************************************************************
+  *           set_initial_dc_state
+  */
+@@ -194,6 +218,7 @@ static void set_initial_dc_state( DC *dc )
+     dc->xformWorld2Vport    = dc->xformWorld2Wnd;
+     dc->xformVport2World    = dc->xformWorld2Wnd;
+     dc->vport2WorldValid    = TRUE;
++    apply_device_scale( dc );
+ 
+     reset_bounds( &dc->bounds );
+ }
+@@ -465,6 +490,7 @@ void DC_UpdateXforms( DC *dc )
+     /* Create inverse of world-to-viewport transformation */
+     dc->vport2WorldValid = DC_InvertXform( &dc->xformWorld2Vport,
+         &dc->xformVport2World );
++    apply_device_scale( dc );
+ 
+     /* Reselect the font and pen back into the dc so that the size
+        gets updated. */
+@@ -1208,10 +1234,21 @@ BOOL WINAPI NtGdiGetTransform( HDC hdc, DWORD which, XFORM *xform )
+ 
+     case 0x204:
+         *xform = dc->xformWorld2Vport;
++        if (dc_is_scaled( dc ))
++        {
++            double scale = dc_scale( dc );
++            xform->eM11 /= scale; xform->eM12 /= scale; xform->eM21 /= scale;
++            xform->eM22 /= scale; xform->eDx /= scale; xform->eDy /= scale;
++        }
+         break;
+ 
+     case 0x402:
+         *xform = dc->xformVport2World;
++        if (dc_is_scaled( dc ))
++        {
++            double scale = dc_scale( dc );
++            xform->eM11 *= scale; xform->eM12 *= scale; xform->eM21 *= scale; xform->eM22 *= scale;
++        }
+         break;
+ 
+     default:
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 67d3dc84bc..d6d75d0ccc 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -148,6 +148,7 @@ struct scaled_surface
+     struct window_surface *target_surface;
+     struct ratio dpi_from;
+     struct ratio dpi_to;
++    BOOL gdi_scaled;    /* GDI scaling: DCs draw into the target surface at its DPI */
+ };
+ 
+ static struct scaled_surface *get_scaled_surface( struct window_surface *window_surface )
+@@ -254,6 +255,7 @@ static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surf
+     {
+         surface = get_scaled_surface( window_surface );
+         surface->dpi_from = dpi_from;
++        surface->gdi_scaled = gdi_scaling && !(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED);
+         scaled_surface_set_target( surface, target_surface, dpi_to );
+     }
+ 
+@@ -613,6 +615,24 @@ void window_surface_unlock( struct window_surface *surface )
+     pthread_mutex_unlock( &surface->mutex );
+ }
+ 
++/* GDI scaling: the window's DCs draw into the target surface, which is the one to flush */
++static struct window_surface *get_gdi_scaled_target( struct window_surface *surface, struct ratio *from, struct ratio *to )
++{
++    struct scaled_surface *scaled;
++
++    if (!surface || surface == &dummy_surface || surface->funcs != &scaled_surface_funcs) return NULL;
++    scaled = get_scaled_surface( surface );
++    if (!scaled->gdi_scaled) return NULL;
++    if (from) *from = scaled->dpi_from;
++    if (to) *to = scaled->dpi_to;
++    return scaled->target_surface;
++}
++
++BOOL is_gdi_scaled_surface( struct window_surface *surface )
++{
++    return get_gdi_scaled_target( surface, NULL, NULL ) != NULL;
++}
++
+ void window_surface_flush( struct window_surface *surface )
+ {
+     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+@@ -621,6 +641,31 @@ void window_surface_flush( struct window_surface *surface )
+     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
+     RECT dirty = surface->rect, bounds;
+     void *color_bits;
++    struct window_surface *target;
++    struct ratio from, to;
++
++    if ((target = get_gdi_scaled_target( surface, &from, &to )))
++    {
++        /* what reaches this surface itself (an expose, a new shape) goes on to the target */
++        HRGN shape = 0;
++
++        window_surface_lock( surface );
++        bounds = surface->bounds;
++        reset_bounds( &surface->bounds );
++        if (surface->shape_region) shape = map_dpi_region( surface->shape_region, from, to );
++        window_surface_unlock( surface );
++
++        if (!IsRectEmpty( &bounds ))
++        {
++            bounds = map_dpi_rect( bounds, from, to );
++            window_surface_lock( target );
++            add_bounds_rect( &target->bounds, &bounds );
++            window_surface_unlock( target );
++        }
++        window_surface_set_shape( target, shape ); /* flushes the target */
++        if (shape) NtGdiDeleteObjectApp( shape );
++        return;
++    }
+ 
+     window_surface_lock( surface );
+ 
+@@ -817,7 +862,8 @@ static void dump_rdw_flags(UINT flags)
+  */
+ static void update_visible_region( struct dce *dce )
+ {
+-    struct window_surface *surface = NULL;
++    struct window_surface *surface = NULL, *target;
++    struct ratio from, to;
+     NTSTATUS status;
+     HRGN vis_rgn = 0;
+     HWND top_win = 0;
+@@ -880,7 +926,10 @@ static void update_visible_region( struct dce *dce )
+     }
+ 
+     if (!surface) SetRectEmpty( &top_rect );
+-    set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
++    if ((target = get_gdi_scaled_target( surface, &from, &to )))
++        set_visible_region_scaled( dce->hdc, vis_rgn, &win_rect, &top_rect, target, from, to );
++    else
++        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
+     if (surface) window_surface_release( surface );
+ }
+ 
+diff --git a/dlls/win32u/dib.c b/dlls/win32u/dib.c
+index 6151e8312f..8aff3603a9 100644
+--- a/dlls/win32u/dib.c
++++ b/dlls/win32u/dib.c
+@@ -654,10 +654,31 @@ INT WINAPI NtGdiStretchDIBitsInternal( HDC hdc, INT xDst, INT yDst, INT widthDst
+ }
+ 
+ 
++static int set_di_bits_unscaled( HDC hdc, HBITMAP hbitmap, UINT startscan, UINT lines, LPCVOID bits,
++                                 const BITMAPINFO *info, UINT coloruse );
++
+ /* Sets pixels in a bitmap using colors from DIB, see SetDIBits */
+ static int set_di_bits( HDC hdc, HBITMAP hbitmap, UINT startscan,
+                         UINT lines, LPCVOID bits, const BITMAPINFO *info,
+                         UINT coloruse )
++{
++    /* GDI scaling: the program's bits, at its size, scaled into the bitmap */
++    if (is_scaled_bitmap( hbitmap ))
++    {
++        HBITMAP copy = unscaled_bitmap_copy( hbitmap );
++        int ret;
++        if (!copy) return 0;
++        if ((ret = set_di_bits_unscaled( hdc, copy, startscan, lines, bits, info, coloruse )))
++            copy_bitmap_scaled( copy, hbitmap );
++        NtGdiDeleteObjectApp( copy );
++        return ret;
++    }
++    return set_di_bits_unscaled( hdc, hbitmap, startscan, lines, bits, info, coloruse );
++}
++
++static int set_di_bits_unscaled( HDC hdc, HBITMAP hbitmap, UINT startscan,
++                                 UINT lines, LPCVOID bits, const BITMAPINFO *info,
++                                 UINT coloruse )
+ {
+     BITMAPOBJ *bitmap;
+     char src_bmibuf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+@@ -849,6 +870,37 @@ INT nulldrv_SetDIBitsToDevice( PHYSDEV dev, INT x_dst, INT y_dst, DWORD cx, DWOR
+     dst.y = pt.y;
+     dst.width = cx;
+     dst.height = cy;
++
++    if (dc_is_scaled( dc ))
++    {
++        /* GDI scaling: the bits cover as many of the program's pixels, so they are stretched */
++        double scale = dc_scale( dc );
++
++        dst.width = GDI_ROUND( cx * scale );
++        dst.height = GDI_ROUND( cy * scale );
++        get_bounding_rect( &rect, dst.x, dst.y, dst.width, dst.height );
++        if (!clip_visrect( dc, &dst.visrect, &rect )) goto done;
++        if (!intersect_vis_rectangles( &dst, &src )) goto done;
++
++        dev = GET_DC_PHYSDEV( dc, pPutImage );
++        copy_bitmapinfo( dst_info, src_info );
++        err = dev->funcs->pPutImage( dev, 0, dst_info, &src_bits, &src, &dst, SRCCOPY );
++        if (err == ERROR_BAD_FORMAT)
++        {
++            err = convert_bits( src_info, &src, dst_info, &src_bits );
++            if (!err) err = dev->funcs->pPutImage( dev, 0, dst_info, &src_bits, &src, &dst, SRCCOPY );
++        }
++        if (err == ERROR_TRANSFORM_NOT_SUPPORTED)
++        {
++            copy_bitmapinfo( src_info, dst_info );
++            err = stretch_bits( src_info, &src, dst_info, &dst, &src_bits,
++                                scale > 1 ? STRETCH_DELETESCANS : STRETCH_HALFTONE );
++            if (!err) err = dev->funcs->pPutImage( dev, 0, dst_info, &src_bits, &src, &dst, SRCCOPY );
++        }
++        if (err) lines = 0;
++        goto done;
++    }
++
+     if (dc->attr->layout & LAYOUT_RTL) dst.x -= cx - 1;
+ 
+     rect.left = dst.x;
+@@ -1199,9 +1251,29 @@ BITMAPINFO *copy_packed_dib( const BITMAPINFO *src_info, UINT usage )
+  *
+  * Retrieves bits of bitmap and copies to buffer.
+  */
++static INT get_di_bits( HDC hdc, HBITMAP hbitmap, UINT startscan, UINT lines, void *bits,
++                        BITMAPINFO *info, UINT coloruse, UINT max_bits, UINT max_info );
++
+ INT WINAPI NtGdiGetDIBitsInternal( HDC hdc, HBITMAP hbitmap, UINT startscan, UINT lines,
+                                    void *bits, BITMAPINFO *info, UINT coloruse,
+                                    UINT max_bits, UINT max_info )
++{
++    /* GDI scaling: a scaled bitmap's bits at the size the program asked for */
++    if (is_scaled_bitmap( hbitmap ))
++    {
++        HBITMAP copy = unscaled_bitmap_copy( hbitmap );
++        INT ret;
++        if (!copy) return 0;
++        ret = get_di_bits( hdc, copy, startscan, lines, bits, info, coloruse, max_bits, max_info );
++        NtGdiDeleteObjectApp( copy );
++        return ret;
++    }
++    return get_di_bits( hdc, hbitmap, startscan, lines, bits, info, coloruse, max_bits, max_info );
++}
++
++static INT get_di_bits( HDC hdc, HBITMAP hbitmap, UINT startscan, UINT lines,
++                        void *bits, BITMAPINFO *info, UINT coloruse,
++                        UINT max_bits, UINT max_info )
+ {
+     DC * dc;
+     BITMAPOBJ * bmp;
+diff --git a/dlls/win32u/dibdrv/graphics.c b/dlls/win32u/dibdrv/graphics.c
+index 92dea91158..c6a6b05ec0 100644
+--- a/dlls/win32u/dibdrv/graphics.c
++++ b/dlls/win32u/dibdrv/graphics.c
+@@ -158,6 +158,11 @@ static void add_pen_lines_bounds( dibdrv_physdev *dev, int count, const POINT *p
+         }
+     }
+ 
++    /* GDI scaling: a cosmetic pen's pixels are blocks of the display's pixels */
++    if (!dev->pen_uses_region && dc_is_scaled( get_physdev_dc( &dev->dev ) ) &&
++        dc_scale( get_physdev_dc( &dev->dev ) ) > 1)
++        width = (int)ceil( dc_scale( get_physdev_dc( &dev->dev ) ) );
++
+     while (count-- > 0)
+     {
+         rect.left   = points->x - width;
+@@ -1430,6 +1435,19 @@ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
+         ret = pen_region( pdev, outline );
+         NtGdiDeleteObjectApp( outline );
+     }
++    else if (dc_is_scaled( dc ) && dc_scale( dc ) > 1 && pdev->pen_width)
++    {
++        /* GDI scaling: the border is a block of the display's pixels wide */
++        double scale = dc_scale( dc );
++        RECT inner;
++        inner.left   = (int)floor( (floor( (rect.left + 0.5) / scale ) + 1) * scale + 0.5 );
++        inner.top    = (int)floor( (floor( (rect.top + 0.5) / scale ) + 1) * scale + 0.5 );
++        inner.right  = (int)floor( floor( (rect.right + 0.5) / scale ) * scale + 0.5 );
++        inner.bottom = (int)floor( floor( (rect.bottom + 0.5) / scale ) * scale + 0.5 );
++        ret = TRUE;
++        if (inner.left < inner.right && inner.top < inner.bottom)
++            ret = brush_rect( pdev, &pdev->brush, &inner, pdev->clip );
++    }
+     else
+     {
+         rect.left   += (pdev->pen_width + 1) / 2;
+diff --git a/dlls/win32u/dibdrv/objects.c b/dlls/win32u/dibdrv/objects.c
+index 9825d95fe1..ae9b47e845 100644
+--- a/dlls/win32u/dibdrv/objects.c
++++ b/dlls/win32u/dibdrv/objects.c
+@@ -804,6 +804,9 @@ static BOOL solid_pen_line_region( dibdrv_physdev *pdev, POINT *start, POINT *en
+     return TRUE;
+ }
+ 
++static void scaled_cosmetic_line( dibdrv_physdev *pdev, double scale, const POINT *start, const POINT *end,
++                                  BOOL dashed, DWORD and, DWORD xor );
++
+ static BOOL solid_pen_lines(dibdrv_physdev *pdev, int num, POINT *pts, BOOL close, HRGN region)
+ {
+     DC *dc = get_physdev_dc( &pdev->dev );
+@@ -825,6 +828,14 @@ static BOOL solid_pen_lines(dibdrv_physdev *pdev, int num, POINT *pts, BOOL clos
+         color = get_pixel_color( dc, &pdev->dib, pdev->pen_brush.colorref, TRUE );
+         calc_and_xor_masks( dc->attr->rop_mode, color, &and, &xor );
+ 
++        if (dc_is_scaled( dc ) && dc_scale( dc ) > 1)
++        {
++            double scale = dc_scale( dc );
++            for (i = 0; i < num - 1; i++) scaled_cosmetic_line( pdev, scale, pts + i, pts + i + 1, FALSE, and, xor );
++            if (close) scaled_cosmetic_line( pdev, scale, pts + num - 1, pts, FALSE, and, xor );
++            return TRUE;
++        }
++
+         for (i = 0; i < num - 1; i++)
+             if (!solid_pen_line( pdev, pts + i, pts + i + 1, and, xor ))
+                 return FALSE;
+@@ -859,6 +870,93 @@ static inline void skip_dash(dibdrv_physdev *pdev, unsigned int skip)
+     while (skip);
+ }
+ 
++/* GDI scaling: a cosmetic pen is one of the program's pixels wide, so in a scaled DC each of
++ * the line's pixels, worked out in the program's pixels, is drawn as the block of the display's
++ * pixels it covers. Lines then stay solid and meet rectangles as they do unscaled. */
++static inline int scaled_coord( double scale, int x )
++{
++    return (int)floor( x * scale + 0.5 );
++}
++
++static inline int unscaled_coord( double scale, int x )
++{
++    return (int)floor( (x + 0.5) / scale );
++}
++
++static void scaled_block( dibdrv_physdev *pdev, double scale, int x, int y, int x2, int y2, DWORD and, DWORD xor )
++{
++    struct clipped_rects clipped_rects;
++    RECT rect;
++
++    rect.left   = scaled_coord( scale, x );
++    rect.top    = scaled_coord( scale, y );
++    rect.right  = max( rect.left + 1, scaled_coord( scale, x2 ) );
++    rect.bottom = max( rect.top + 1, scaled_coord( scale, y2 ) );
++    if (!get_clipped_rects( &pdev->dib, &rect, pdev->clip, &clipped_rects )) return;
++    pdev->dib.funcs->solid_rects( &pdev->dib, clipped_rects.count, clipped_rects.rects, and, xor );
++    free_clipped_rects( &clipped_rects );
++}
++
++static void scaled_cosmetic_line( dibdrv_physdev *pdev, double scale, const POINT *start, const POINT *end,
++                                  BOOL dashed, DWORD and, DWORD xor )
++{
++    int x1 = unscaled_coord( scale, start->x ), y1 = unscaled_coord( scale, start->y );
++    int x2 = unscaled_coord( scale, end->x ), y2 = unscaled_coord( scale, end->y );
++    int dx = abs( x2 - x1 ), dy = abs( y2 - y1 ), sx = x1 < x2 ? 1 : -1, sy = y1 < y2 ? 1 : -1;
++    int err = dx - dy, x = x1, y = y1;
++
++    if (!dashed && (y1 == y2 || x1 == x2))
++    {
++        /* the last pixel isn't drawn */
++        if (y1 == y2 && x1 != x2) scaled_block( pdev, scale, min( x1, x2 + 1 ), y1, max( x1 + 1, x2 ), y1 + 1, and, xor );
++        else if (x1 == x2 && y1 != y2) scaled_block( pdev, scale, x1, min( y1, y2 + 1 ), x1 + 1, max( y1 + 1, y2 ), and, xor );
++        return;
++    }
++
++    if (!dashed)
++    {
++        /* a slanted line: its course in the display's pixels, each point a block wide */
++        int block = max( 1, (int)floor( scale + 0.5 ) );
++        int px = scaled_coord( scale, x1 ), py = scaled_coord( scale, y1 );
++        int qx = scaled_coord( scale, x2 ), qy = scaled_coord( scale, y2 );
++        int ddx = abs( qx - px ), ddy = abs( qy - py ), stx = px < qx ? 1 : -1, sty = py < qy ? 1 : -1;
++        int e = ddx - ddy;
++
++        while (px != qx || py != qy)
++        {
++            int e2 = 2 * e;
++            struct clipped_rects clipped_rects;
++            RECT rect = { px, py, px + block, py + block };
++
++            if (get_clipped_rects( &pdev->dib, &rect, pdev->clip, &clipped_rects ))
++            {
++                pdev->dib.funcs->solid_rects( &pdev->dib, clipped_rects.count, clipped_rects.rects, and, xor );
++                free_clipped_rects( &clipped_rects );
++            }
++            if (e2 > -ddy) { e -= ddy; px += stx; }
++            if (e2 < ddx) { e += ddx; py += sty; }
++        }
++        return;
++    }
++
++    while (x != x2 || y != y2)
++    {
++        if (dashed)
++        {
++            rop_mask mask = pdev->dash_masks[pdev->dash_pos.mark];
++            skip_dash( pdev, 1 );
++            scaled_block( pdev, scale, x, y, x + 1, y + 1, mask.and, mask.xor );
++        }
++        else scaled_block( pdev, scale, x, y, x + 1, y + 1, and, xor );
++
++        {
++            int e2 = 2 * err;
++            if (e2 > -dy) { err -= dy; x += sx; }
++            if (e2 < dx) { err += dx; y += sy; }
++        }
++    }
++}
++
+ static void dashed_pen_line_callback(dibdrv_physdev *pdev, INT x, INT y)
+ {
+     RECT rect;
+@@ -1237,6 +1335,14 @@ static BOOL dashed_pen_lines(dibdrv_physdev *pdev, int num, POINT *pts, BOOL clo
+                          pdev->pen_is_ext ? TRANSPARENT : dc->attr->background_mode,
+                          &pdev->dash_masks[1], &pdev->dash_masks[0] );
+ 
++        if (dc_is_scaled( dc ) && dc_scale( dc ) > 1)
++        {
++            double scale = dc_scale( dc );
++            for (i = 0; i < num - 1; i++) scaled_cosmetic_line( pdev, scale, pts + i, pts + i + 1, TRUE, 0, 0 );
++            if (close) scaled_cosmetic_line( pdev, scale, pts + num - 1, pts, TRUE, 0, 0 );
++            return TRUE;
++        }
++
+         for (i = 0; i < num - 1; i++)
+             if (!dashed_pen_line( pdev, pts + i, pts + i + 1 ))
+                 return FALSE;
+@@ -1768,6 +1874,8 @@ static inline int get_pen_device_width( DC *dc, int width )
+     pts[1].x = width;
+     lp_to_dp( dc, pts, 2 );
+     width = floor( hypot( pts[1].x - pts[0].x, pts[1].y - pts[0].y ));
++    /* GDI scaling: a pen one of the program's pixels wide is drawn as a cosmetic pen, in blocks */
++    if (dc_is_scaled( dc ) && width / dc_scale( dc ) < 1.5) return 1;
+     return max( width, 1 );
+ }
+ 
+diff --git a/dlls/win32u/font.c b/dlls/win32u/font.c
+index 97936e93ad..89010bb3fa 100644
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -2753,6 +2753,7 @@ static void add_child_font( struct gdi_font *font, const WCHAR *family_name )
+     if (!(child = create_gdi_font( face, family_name, &font->lf ))) return;
+     child->matrix = font->matrix;
+     child->can_use_bitmap = font->can_use_bitmap;
++    child->device_scale = font->device_scale;
+     child->scale_y = font->scale_y;
+     child->aveWidth = font->aveWidth;
+     child->charset = font->charset;
+@@ -2813,16 +2814,17 @@ static unsigned int unused_font_count;
+ #define UNUSED_CACHE_SIZE 10
+ 
+ static BOOL fontcmp( const struct gdi_font *font, DWORD hash, const LOGFONTW *lf,
+-                     const FMAT2 *matrix, BOOL can_use_bitmap )
++                     const FMAT2 *matrix, BOOL can_use_bitmap, UINT device_scale )
+ {
+     if (font->hash != hash) return TRUE;
++    if (font->device_scale != device_scale) return TRUE;
+     if (memcmp( &font->matrix, matrix, sizeof(*matrix))) return TRUE;
+     if (memcmp( &font->lf, lf, offsetof(LOGFONTW, lfFaceName))) return TRUE;
+     if (!font->can_use_bitmap != !can_use_bitmap) return TRUE;
+     return facename_compare( font->lf.lfFaceName, lf->lfFaceName, -1 );
+ }
+ 
+-static DWORD hash_font( const LOGFONTW *lf, const FMAT2 *matrix, BOOL can_use_bitmap )
++static DWORD hash_font( const LOGFONTW *lf, const FMAT2 *matrix, BOOL can_use_bitmap, UINT device_scale )
+ {
+     DWORD hash = 0, *ptr, two_chars;
+     WORD *pwc;
+@@ -2844,6 +2846,7 @@ static DWORD hash_font( const LOGFONTW *lf, const FMAT2 *matrix, BOOL can_use_bi
+         if(!*pwc) break;
+     }
+     hash ^= !can_use_bitmap;
++    hash ^= device_scale << 8;
+     return hash;
+ }
+ 
+@@ -2852,20 +2855,21 @@ static void cache_gdi_font( struct gdi_font *font )
+     static DWORD cache_num = 1;
+ 
+     font->cache_num = cache_num++;
+-    font->hash = hash_font( &font->lf, &font->matrix, font->can_use_bitmap );
++    font->hash = hash_font( &font->lf, &font->matrix, font->can_use_bitmap, font->device_scale );
+     list_add_head( &gdi_font_list, &font->entry );
+     TRACE( "font %p\n", font );
+ }
+ 
+-static struct gdi_font *find_cached_gdi_font( const LOGFONTW *lf, const FMAT2 *matrix, BOOL can_use_bitmap )
++static struct gdi_font *find_cached_gdi_font( const LOGFONTW *lf, const FMAT2 *matrix, BOOL can_use_bitmap,
++                                              UINT device_scale )
+ {
+     struct gdi_font *font;
+-    DWORD hash = hash_font( lf, matrix, can_use_bitmap );
++    DWORD hash = hash_font( lf, matrix, can_use_bitmap, device_scale );
+ 
+     /* try the in-use list */
+     LIST_FOR_EACH_ENTRY( font, &gdi_font_list, struct gdi_font, entry )
+     {
+-        if (fontcmp( font, hash, lf, matrix, can_use_bitmap )) continue;
++        if (fontcmp( font, hash, lf, matrix, can_use_bitmap, device_scale )) continue;
+         list_remove( &font->entry );
+         list_add_head( &gdi_font_list, &font->entry );
+         if (!font->refcount++)
+@@ -4421,7 +4425,7 @@ static void get_nearest_charset( const WCHAR *family_name, struct gdi_font_face
+     csi->ciCharset = DEFAULT_CHARSET;
+ }
+ 
+-static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bitmap )
++static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bitmap, UINT device_scale )
+ {
+     struct gdi_font *font;
+     struct gdi_font_face *face;
+@@ -4439,7 +4443,7 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
+     if (!facename_compare( lf->lfFaceName, symbolW, -1 )) lf->lfCharSet = SYMBOL_CHARSET;
+ 
+     /* check the cache first */
+-    if ((font = find_cached_gdi_font( lf, &dcmat, can_use_bitmap )))
++    if ((font = find_cached_gdi_font( lf, &dcmat, can_use_bitmap, device_scale )))
+     {
+         TRACE( "returning cached gdiFont(%p)\n", font );
+         return font;
+@@ -4455,6 +4459,7 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
+     font->use_logfont_name = substituted;
+     font->matrix = dcmat;
+     font->can_use_bitmap = can_use_bitmap;
++    font->device_scale = device_scale;
+     if (!csi.fs.fsCsb[0]) get_nearest_charset( face->family->family_name, face, &csi );
+     font->charset = csi.ciCharset;
+     font->codepage = csi.ciACP;
+@@ -4469,6 +4474,8 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
+         INT scale, scaled_height, diff;
+         struct gdi_font *cachedfont;
+ 
++        if (device_scale > 1) height /= (INT)device_scale;
++
+         if (height > 0)
+             diff = height - (signed int)face->size.height;
+         else
+@@ -4482,7 +4489,7 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
+         dcmat.eM11 = dcmat.eM22 = 1.0;
+         /* As we changed the matrix, we need to search the cache for the font again,
+          * otherwise we might explode the cache. */
+-        if ((cachedfont = find_cached_gdi_font( lf, &dcmat, can_use_bitmap )))
++        if ((cachedfont = find_cached_gdi_font( lf, &dcmat, can_use_bitmap, device_scale )))
+         {
+             TRACE("Found cached font after non-scalable matrix rescale!\n");
+             free_gdi_font( font );
+@@ -4498,6 +4505,8 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
+         if (scale > 2 && scaled_height - height > face->size.height / 4) scale--;
+         /* The jump between unscaled and doubled is delayed by 1 */
+         else if (scale == 2 && scaled_height - height > (face->size.height / 4 - 1)) scale--;
++        /* GDI scaling: the size is the program's, drawn in whole multiples on the display */
++        if (device_scale > 1) scale *= device_scale;
+         font->scale_y = scale;
+         TRACE("font scale y: %d\n", font->scale_y);
+     }
+@@ -4532,6 +4541,7 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
+         LOGFONTW lf;
+         FMAT2 dcmat;
+         BOOL can_use_bitmap = !!(NtGdiGetDeviceCaps( dc->hSelf, TEXTCAPS ) & TC_RA_ABLE);
++        UINT device_scale = 1;
+ 
+         NtGdiExtGetObjectW( hfont, sizeof(lf), &lf );
+         switch (lf.lfQuality)
+@@ -4579,11 +4589,27 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
+                 lf.lfWidth *= fabs(dc->xformWorld2Vport.eM22);
+             }
+         }
++        if (dc_is_scaled( dc ))
++        {
++            /* GDI scaling: bitmap fonts scale in whole numbers; a font of the default height
++             * (0) is scaled with the matrix, as its height can't be */
++            double scale = dc_scale( dc );
++            device_scale = max( 1, (int)floor( scale + 0.5 ) );
++            /* a bitmap font can't be drawn smaller than it is: use an outline font instead */
++            if (scale < 0.75) can_use_bitmap = FALSE;
++            if (!lf.lfHeight && device_scale > 1)
++            {
++                dcmat.eM11 *= device_scale;
++                dcmat.eM12 *= device_scale;
++                dcmat.eM21 *= device_scale;
++                dcmat.eM22 *= device_scale;
++            }
++        }
+         TRACE( "DC transform %f %f %f %f\n", dcmat.eM11, dcmat.eM12, dcmat.eM21, dcmat.eM22 );
+ 
+         pthread_mutex_lock( &font_lock );
+ 
+-        font = select_font( &lf, dcmat, can_use_bitmap );
++        font = select_font( &lf, dcmat, can_use_bitmap, device_scale );
+ 
+         if (font)
+         {
+@@ -4595,6 +4621,18 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
+                 else
+                     *aa_flags = font_smoothing;
+             }
++            /* GDI scaling: text drawn in 1x pixels (not a Retina display's) is rendered for an
++             * LCD's subpixels, as ClearType does on such a display on Windows. Grey smoothing keeps
++             * to the fonts' gasp tables, which ask Tahoma and Segoe UI at menu sizes for none, and
++             * leaves their stems jagged. A scaled DC draws in its display's pixels; any other DC
++             * in the program's own, which a program that isn't DPI aware has at 96 DPI on any
++             * display (native on a 1x one). */
++            if (gdi_scaling && *aa_flags != GGO_BITMAP)
++            {
++                struct ratio pixels = dc_is_scaled( dc ) ? dc->scale_to : get_thread_dpi();
++                if (pixels.num && pixels.num <= 120 * pixels.den)
++                    *aa_flags = (subpixel_orientation == WINE_GGO_HBGR_BITMAP) ? WINE_GGO_HBGR_BITMAP : WINE_GGO_HRGB_BITMAP;
++            }
+             *aa_flags = font_funcs->get_aa_flags( font, *aa_flags, antialias_fakes );
+         }
+         TRACE( "%p %s %d aa %x\n", hfont, debugstr_w(lf.lfFaceName), lf.lfHeight, *aa_flags );
+diff --git a/dlls/win32u/freetype.c b/dlls/win32u/freetype.c
+index ce89912200..c5fdf15f3a 100644
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -2863,6 +2863,27 @@ static DWORD get_subpixel_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT f
+     return needed;
+ }
+ 
++static DWORD get_glyph_bitmap_scaled( struct gdi_font *font, FT_Face ft_face, FT_BBox bbox, UINT format,
++                                      const FT_Matrix *matrices, GLYPHMETRICS *lpgm, DWORD buflen, BYTE *buf )
++{
++    switch (format)
++    {
++    case GGO_BITMAP:
++        return get_mono_glyph_bitmap( ft_face->glyph, bbox, font->fake_bold, matrices, buflen, buf );
++    case GGO_GRAY2_BITMAP:
++    case GGO_GRAY4_BITMAP:
++    case GGO_GRAY8_BITMAP:
++    case WINE_GGO_GRAY16_BITMAP:
++        return get_antialias_glyph_bitmap( ft_face->glyph, bbox, format, font->fake_bold, matrices, buflen, buf );
++    case WINE_GGO_HRGB_BITMAP:
++    case WINE_GGO_HBGR_BITMAP:
++    case WINE_GGO_VRGB_BITMAP:
++    case WINE_GGO_VBGR_BITMAP:
++        return get_subpixel_glyph_bitmap( ft_face->glyph, bbox, format, font->fake_bold, matrices, lpgm, buflen, buf );
++    }
++    return GDI_ERROR;
++}
++
+ static unsigned int get_native_glyph_outline(FT_Outline *outline, unsigned int buflen, char *buf)
+ {
+     TTPOLYGONHEADER *pph;
+@@ -3167,6 +3188,34 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT
+     bbox = get_transformed_bbox( &metrics, matrices );
+     compute_metrics( font, bbox, &metrics, tategaki, vertical_metrics, matrices, lpgm, abc );
+ 
++    /* GDI scaling: a bitmap font drawn at a whole multiple of the program's size has its
++     * glyph's pixels repeated, as Windows does, to fill the box its metrics give it */
++    if (font->device_scale > 1 && font->scale_y > 1 && format != GGO_METRICS && format != GGO_NATIVE && format != GGO_BEZIER &&
++        ft_face->glyph->format == FT_GLYPH_FORMAT_BITMAP &&
++        ft_face->glyph->bitmap.pixel_mode == FT_PIXEL_MODE_MONO && ft_face->glyph->bitmap.width)
++    {
++        FT_Bitmap orig = ft_face->glyph->bitmap, *bm = &ft_face->glyph->bitmap;
++        UINT k = font->device_scale, x, y, pitch = ((orig.width * k + 31) >> 5) << 2;
++        BYTE *bits = calloc( pitch, orig.rows * k );
++        DWORD ret;
++
++        if (bits)
++        {
++            for (y = 0; y < orig.rows * k; y++)
++                for (x = 0; x < orig.width * k; x++)
++                    if (orig.buffer[(y / k) * orig.pitch + (x / k) / 8] & (0x80 >> ((x / k) % 8)))
++                        bits[y * pitch + x / 8] |= 0x80 >> (x % 8);
++            bm->buffer = bits;
++            bm->width = orig.width * k;
++            bm->rows = orig.rows * k;
++            bm->pitch = pitch;
++            ret = get_glyph_bitmap_scaled( font, ft_face, bbox, format, matrices, lpgm, buflen, buf );
++            *bm = orig;
++            free( bits );
++            return ret;
++        }
++    }
++
+     switch (format)
+     {
+     case GGO_METRICS:
+diff --git a/dlls/win32u/mapping.c b/dlls/win32u/mapping.c
+index ecdbf45720..205f4d9b58 100644
+--- a/dlls/win32u/mapping.c
++++ b/dlls/win32u/mapping.c
+@@ -209,11 +209,15 @@ BOOL WINAPI NtGdiTransformPoints( HDC hdc, const POINT *points_in, POINT *points
+                                   INT count, UINT mode )
+ {
+     DC *dc = get_dc_ptr( hdc );
++    double scale;
+     int i = 0;
+     BOOL ret = FALSE;
+ 
+     if (!dc) return FALSE;
+ 
++    /* GDI scaling: the program sees its own device coordinates, not the display's */
++    scale = dc_is_scaled( dc ) ? dc_scale( dc ) : 1.0;
++
+     switch (mode)
+     {
+     case NtGdiLPtoDP:
+@@ -221,12 +225,12 @@ BOOL WINAPI NtGdiTransformPoints( HDC hdc, const POINT *points_in, POINT *points
+         {
+             double x = points_in[i].x;
+             double y = points_in[i].y;
+-            points_out[i].x = GDI_ROUND( x * dc->xformWorld2Vport.eM11 +
+-                                         y * dc->xformWorld2Vport.eM21 +
+-                                         dc->xformWorld2Vport.eDx );
+-            points_out[i].y = GDI_ROUND( x * dc->xformWorld2Vport.eM12 +
+-                                         y * dc->xformWorld2Vport.eM22 +
+-                                         dc->xformWorld2Vport.eDy );
++            points_out[i].x = GDI_ROUND( (x * dc->xformWorld2Vport.eM11 +
++                                          y * dc->xformWorld2Vport.eM21 +
++                                          dc->xformWorld2Vport.eDx) / scale );
++            points_out[i].y = GDI_ROUND( (x * dc->xformWorld2Vport.eM12 +
++                                          y * dc->xformWorld2Vport.eM22 +
++                                          dc->xformWorld2Vport.eDy) / scale );
+         }
+         ret = TRUE;
+         break;
+@@ -235,8 +239,8 @@ BOOL WINAPI NtGdiTransformPoints( HDC hdc, const POINT *points_in, POINT *points
+         if (!dc->vport2WorldValid) break;
+         for (i = 0; i < count; i++)
+         {
+-            double x = points_in[i].x;
+-            double y = points_in[i].y;
++            double x = points_in[i].x * scale;
++            double y = points_in[i].y * scale;
+             points_out[i].x = GDI_ROUND( x * dc->xformVport2World.eM11 +
+                                          y * dc->xformVport2World.eM21 +
+                                          dc->xformVport2World.eDx );
+diff --git a/dlls/win32u/ntgdi_private.h b/dlls/win32u/ntgdi_private.h
+index fcfbce58fe..00904886df 100644
+--- a/dlls/win32u/ntgdi_private.h
++++ b/dlls/win32u/ntgdi_private.h
+@@ -64,6 +64,8 @@ typedef struct tagDC
+     struct opengl_drawable *opengl_drawable; /* GL driver drawable for the DC */
+ 
+     RECT         device_rect;      /* rectangle for the whole device */
++    struct ratio scale_from;       /* GDI scaling: the program's DPI (num 0 when not scaled) */
++    struct ratio scale_to;         /* GDI scaling: the DPI of the pixels the DC draws */
+     int          pixel_format;     /* pixel format (for memory DCs) */
+     UINT         aa_flags;         /* anti-aliasing flags to pass to GetGlyphOutline for current font */
+     WCHAR        display[CCHDEVICENAME]; /* Display name when created for a specific display device */
+@@ -139,6 +141,9 @@ typedef struct tagBITMAPOBJ
+     DIBSECTION            dib;
+     SIZE                  size;   /* For SetBitmapDimension() */
+     RGBQUAD              *color_table;  /* DIB color table if <= 8bpp (always 1 << bpp in size) */
++    struct ratio          scale_from;   /* GDI scaling: the program's DPI (num 0 when not scaled) */
++    struct ratio          scale_to;     /* GDI scaling: the DPI of the bitmap's pixels */
++    SIZE                  program_size; /* GDI scaling: the size the program asked for */
+ } BITMAPOBJ;
+ 
+ static inline BOOL is_bitmapobj_dib( const BITMAPOBJ *bmp )
+@@ -165,6 +170,19 @@ extern BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src );
+ extern BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src );
+ extern void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect,
+                                 const RECT *device_rect, struct window_surface *surface );
++extern void set_visible_region_scaled( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
++                                       struct window_surface *surface, struct ratio from, struct ratio to );
++
++/* GDI scaling: a window DC draws at its display's DPI while the program sees its own */
++static inline BOOL dc_is_scaled( const DC *dc ) { return dc->scale_from.num != 0; }
++static inline double dc_scale( const DC *dc )
++{
++    return (double)dc->scale_to.num * dc->scale_from.den / ((double)dc->scale_to.den * dc->scale_from.num);
++}
++extern HRGN dc_scale_region( const DC *dc, HRGN hrgn, BOOL to_device );
++extern BOOL is_scaled_bitmap( HBITMAP hbitmap );
++extern HBITMAP unscaled_bitmap_copy( HBITMAP hbitmap );
++extern BOOL copy_bitmap_scaled( HBITMAP src, HBITMAP dst );
+ extern void update_dc_clipping( DC * dc );
+ 
+ /* Return the total DC region (if any) */
+@@ -285,6 +303,7 @@ struct gdi_font
+     UINT                   aa_flags;
+     ULONG                  ttc_item_offset;    /* 0 if font is not a part of TrueType collection */
+     UINT                   can_use_bitmap : 1;
++    UINT                   device_scale : 8;  /* GDI scaling: whole-number scale for bitmap fonts */
+     UINT                   fake_italic : 1;
+     UINT                   fake_bold : 1;
+     UINT                   scalable : 1;
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 16649ad69e..b26a0f0d9e 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -173,6 +173,7 @@ BOOL emulate_modeset = TRUE;
+ BOOL emulate_modeset = FALSE;
+ #endif
+ BOOL decorated_mode = TRUE;
++BOOL gdi_scaling = FALSE;
+ UINT64 thunk_lock_callback = 0;
+ 
+ #define VIRTUAL_HMONITOR ((HMONITOR)(UINT_PTR)(0x10000 + 1))
+@@ -6137,7 +6138,10 @@ void sysparams_init(void)
+     {
+         if (strstr( app_compat_flags, "HIGHDPIAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_SYSTEM_AWARE, 0 );
+         if (strstr( app_compat_flags, "DPIUNAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_UNAWARE, 0 );
++        /* Windows' "System (Enhanced)": GDI draws at the display's DPI instead of being stretched */
++        if (strstr( app_compat_flags, "GDIDPISCALING" )) gdi_scaling = TRUE;
+     }
++    if (getenv( "WINE_GDI_SCALING" )) gdi_scaling = atoi( getenv( "WINE_GDI_SCALING" ) ) != 0;
+     free( app_compat_flags );
+ }
+ 
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 0e7f421c51..09aae83822 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -162,6 +162,8 @@ extern void track_scroll_bar( HWND hwnd, int scrollbar, POINT pt );
+ extern UINT system_dpi;
+ extern BOOL emulate_modeset;
+ extern BOOL decorated_mode;
++extern BOOL gdi_scaling;
++extern BOOL is_gdi_scaled_surface( struct window_surface *surface );
+ extern UINT64 thunk_lock_callback;
+ extern HBRUSH get_55aa_brush(void);
+ extern DWORD get_dialog_base_units(void);
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 72d9d9d8b9..05d66d708e 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2457,7 +2457,10 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+                 RECT rects[2] = {valid_rects[0], valid_rects[1]};
+                 valid_rects = rects;
+ 
+-                if (old_surface != new_surface)
++                if (old_surface != new_surface && (is_gdi_scaled_surface( old_surface ) || is_gdi_scaled_surface( new_surface )))
++                    /* GDI scaling: the window's pixels are of another density now, so it is drawn again */
++                    NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
++                else if (old_surface != new_surface)
+                     move_window_bits_surface( hwnd, &new_rects->window, old_surface, &old_rects.visible, valid_rects );
+                 else
+                 {
+-- 
+2.56.1
+

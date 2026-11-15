@@ -1,0 +1,34 @@
+From dff5c30ecc99914664f7551e4ebda107e6bf0295 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Sun, 15 Nov 2026 18:39:34 +0100
+Subject: [PATCH 63/65] win32u: Crop a window's surface to the virtual screen
+ in the thread's DPI.
+
+The window's visible rect is in the thread's DPI, and was cropped to the virtual screen in raw
+pixels. For a system DPI aware program, a window on a display with a lower DPI than the system's
+lies further right and down in its own coordinates than in raw pixels, so the crop could leave
+nothing: the window got no surface and showed only its background.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/win32u/window.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index b47333b3d9..72d9d9d8b9 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2179,7 +2179,9 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
+ 
+ static BOOL get_surface_rect( const RECT *visible_rect, RECT *surface_rect )
+ {
+-    RECT virtual_rect = get_virtual_screen_rect( no_dpi, MDT_RAW_DPI );
++    /* the visible rect is in the thread's DPI, as the virtual screen must be: in raw pixels, a
++     * window on a display with another DPI than the system's can be outside it, and get no surface */
++    RECT virtual_rect = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+ 
+     *surface_rect = *visible_rect;
+ 
+-- 
+2.56.1
+

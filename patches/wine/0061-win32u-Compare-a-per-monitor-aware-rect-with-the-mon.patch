@@ -1,0 +1,34 @@
+From 0150ded86eda893db9fdff89d2552c5bece5ccfa Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Sun, 15 Nov 2026 18:39:34 +0100
+Subject: [PATCH 61/65] win32u: Compare a per-monitor aware rect with the
+ monitors' own rects in MonitorFromRect.
+
+A per-monitor aware thread's rects are in each monitor's own pixels. MonitorFromRect compared
+them with the monitors' rects at the system DPI, which are the same only while every monitor has
+the system DPI. With a 96-DPI display beside a 192-DPI one, a rect on the 96-DPI display matched
+no monitor, and a window moved there was judged to be on the other one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/win32u/sysparams.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 65ea8612cf..16649ad69e 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -4831,7 +4831,9 @@ static BOOL get_monitor_info( HMONITOR handle, MONITORINFO *info, struct ratio d
+ 
+ static HMONITOR monitor_from_rect( const RECT *rect, UINT flags, struct ratio dpi_from )
+ {
+-    struct ratio dpi = {system_dpi, 1};
++    /* a per-monitor aware rect is in each monitor's own pixels, which are only the system DPI's
++     * when every monitor has the system DPI: compare it with the monitors' own rects */
++    struct ratio dpi = dpi_from.num ? (struct ratio){system_dpi, 1} : no_dpi;
+     struct monitor *monitor;
+     HMONITOR ret = 0;
+     RECT r;
+-- 
+2.56.1
+
