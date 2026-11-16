@@ -1,0 +1,245 @@
+From 56917f41895c6a9c9a7276f15b8a2d18f0a67932 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Mon, 16 Nov 2026 22:56:50 +0100
+Subject: [PATCH] Windows: Trap self-modifying code by whole host pages on
+ macOS
+
+FEX traps writes to x86 code at 4K pages, but Wine on Apple silicon has 16K
+host pages: it keeps the 4K protections, yet applies their union to each host
+page. A 4K page trapped read-only stayed writable while a sibling 4K page of
+its host page was writable, so writes to code went unseen and FEX ran stale
+translations. V8 (Microsoft 365's v8jsi.dll, x86-64) then died with "Fatal
+error: unreachable code", and Outlook's "Sign in to set up Office" dialog
+stayed blank.
+
+The unix helper now reports the host page size; RWX intervals are trapped by
+whole host pages, and a write fault untraps and invalidates the whole host
+page. On 4K hosts nothing changes.
+
+Proven with Gentes' harness v8jsi-script (2000 fresh functions compiled,
+deoptimized and collected): 2 of 2 runs failed before, 2 of 2 pass after
+(1.7 s and 1.8 s); full SMC checks also pass but take 27.4 s. Outlook's
+sign-in dialog draws with default settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/Common/FEXUnixLib.cpp          | 10 ++++
+ Source/Windows/Common/FEXUnixLib.h            |  7 +++
+ Source/Windows/Common/InvalidationTracker.cpp | 56 ++++++++++++++-----
+ Source/Windows/Common/InvalidationTracker.h   |  5 ++
+ Source/Windows/UnixLib/FEXUnixLib.cpp         | 12 ++++
+ Source/Windows/UnixLib/FEXUnixLib.h           |  6 ++
+ 6 files changed, 83 insertions(+), 13 deletions(-)
+
+diff --git a/Source/Windows/Common/FEXUnixLib.cpp b/Source/Windows/Common/FEXUnixLib.cpp
+index d59f1782f..bd8570f2d 100644
+--- a/Source/Windows/Common/FEXUnixLib.cpp
++++ b/Source/Windows/Common/FEXUnixLib.cpp
+@@ -10,6 +10,7 @@
+ #include <libloaderapi.h>
+ #include "Allocator.h"
+ #include "FEXUnixLib.h"
++#include <FEXCore/Utils/TypeDefines.h>
+ #include "Priv.h"
+ 
+ #define PR_SET_VMA 0x53564d41
+@@ -127,6 +128,15 @@ bool SetKernelUnalignedAtomicControl(uint64_t Flags) {
+   return Call(FEXUnixLibFunctions::SetKernelUnalignedAtomicControl, &Args) == STATUS_SUCCESS;
+ }
+ 
++uint64_t GetHostPageSize() {
++  FEXUnixLib_GetHostPageSize Args {};
++  if (!Available() || Call(FEXUnixLibFunctions::GetHostPageSize, &Args) != STATUS_SUCCESS || Args.Size < FEXCore::Utils::FEX_PAGE_SIZE ||
++      (Args.Size & (Args.Size - 1))) {
++    return FEXCore::Utils::FEX_PAGE_SIZE;
++  }
++  return Args.Size;
++}
++
+ void JITWriteProtect(bool Protect) {
+   FEXUnixLib_JITWriteProtect Args {
+     .Protect = Protect,
+diff --git a/Source/Windows/Common/FEXUnixLib.h b/Source/Windows/Common/FEXUnixLib.h
+index 8a2b2faf6..3b058a668 100644
+--- a/Source/Windows/Common/FEXUnixLib.h
++++ b/Source/Windows/Common/FEXUnixLib.h
+@@ -56,6 +56,13 @@ void DeleteSHMStatsFile();
+ 
+ void* MapFile(HANDLE FileHandle, uint64_t MapSize);
+ 
++/**
++ * @brief The host's page size, which can be larger than Windows' 4K (16K on Apple silicon).
++ *
++ * @return the host page size, or FEX_PAGE_SIZE when it can't be asked.
++ */
++uint64_t GetHostPageSize();
++
+ // Returns the process pid when unixlib is available.
+ // Or returns the process ID otherwise.
+ uint32_t GetPID();
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 155403d35..12130d671 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -7,13 +7,17 @@
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include "InvalidationTracker.h"
++#include <algorithm>
++#include <limits>
++#include "Windows/Common/FEXUnixLib.h"
+ #include <windef.h>
+ #include <winternl.h>
+ 
+ namespace FEX::Windows {
+ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
+   : CTX {CTX}
+-  , Threads {Threads} {
++  , Threads {Threads}
++  , HostPageSize {FEX::Windows::UnixLib::GetHostPageSize()} {
+   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+ 
+@@ -217,26 +221,44 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
+ }
+ 
+ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress) {
+-  const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
++  // The trap covered the faulting page's whole host page (see ProtectRWXIntervalsInternal), so all of
++  // it is untrapped and invalidated: once one of its pages is writable again, the host page is.
++  static constexpr size_t MaxPagesPerHostPage = 16;
++  const uint64_t HostBase = FaultAddress & ~(HostPageSize - 1);
++  const size_t PageCount = std::min<size_t>(HostPageSize / FEXCore::Utils::FEX_PAGE_SIZE, MaxPagesPerHostPage);
++  ULONG UntrapProts[MaxPagesPerHostPage] {};
++
++  const bool NeedsInvalidate = [&]() {
+     std::shared_lock Lock(IntervalsLock);
+-    if (!RWXIntervals.Query(Address).Enclosed) {
+-      return {false, 0};
++    if (!RWXIntervals.Query(FaultAddress).Enclosed) {
++      return false;
++    }
++    for (size_t i = 0; i < PageCount; i++) {
++      const uint64_t Page = HostBase + i * FEXCore::Utils::FEX_PAGE_SIZE;
++      if (RWXIntervals.Query(Page).Enclosed) {
++        UntrapProts[i] = GetUntrapProt(Page);
++      }
+     }
+-    return {true, GetUntrapProt(Address)};
+-  }(FaultAddress);
++    return true;
++  }();
+ 
+   if (NeedsInvalidate) {
+     // IntervalsLock cannot be held during invalidation
+     {
+       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+ 
+-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
++      InvalidateIntervalInternalLocked(HostBase, PageCount * FEXCore::Utils::FEX_PAGE_SIZE);
+ 
+-      // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
+-      ULONG TmpProt;
+-      void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+-      SIZE_T TmpSize = 1;
+-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
++      // Invalidate, then unprotect the host page with the compilation lock held to ensure that any racing invalidations are not dropped.
++      for (size_t i = 0; i < PageCount; i++) {
++        if (!UntrapProts[i]) {
++          continue;
++        }
++        ULONG TmpProt;
++        void* TmpAddress = reinterpret_cast<void*>(HostBase + i * FEXCore::Utils::FEX_PAGE_SIZE);
++        SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
++        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProts[i], &TmpProt);
++      }
+     }
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+@@ -339,7 +361,15 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
+ }
+ 
+ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
+-  const auto End = Address + Size;
++  // Whole host pages: a trap on part of one would leave it writable (see HostPageSize).
++  auto End = Address + Size;
++  if (End < Address || End > std::numeric_limits<uint64_t>::max() - HostPageSize) {
++    End = std::numeric_limits<uint64_t>::max();
++  } else {
++    End = (End + HostPageSize - 1) & ~(HostPageSize - 1);
++  }
++  Address &= ~(HostPageSize - 1);
++  Size = End - Address;
+   std::shared_lock Lock(IntervalsLock);
+ 
+   if (SMCDetectionDisabled) {
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bcaa..a0abddbf6 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -67,6 +67,11 @@ private:
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+ 
++  // Wine keeps Windows' 4K protections per page, but a host with larger pages (16K on Apple silicon)
++  // only gets the union of them for each host page: a 4K page trapped read-only stays writable
++  // while another 4K page of its host page is writable. So traps cover whole host pages.
++  uint64_t HostPageSize;
++
+   bool MonoBackpatcherDetectionPending {false};
+   uint64_t MonoBase {0};
+   uint64_t MonoEnd {0};
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.cpp b/Source/Windows/UnixLib/FEXUnixLib.cpp
+index 632e98a6d..b13d497a1 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.cpp
++++ b/Source/Windows/UnixLib/FEXUnixLib.cpp
+@@ -237,6 +237,17 @@ static NTSTATUS FEXUnixLib_JITWriteProtectHandler(void* _Args) {
+ }
+ #endif
+ 
++// The host's page size: 16K on Apple silicon, where Wine keeps Windows' 4K protections per page but
++// can only apply their union to each host page.
++static NTSTATUS FEXUnixLib_GetHostPageSizeHandler(void* _Args) {
++  const long Size = sysconf(_SC_PAGESIZE);
++  if (Size <= 0) {
++    return STATUS_NOT_SUPPORTED;
++  }
++  reinterpret_cast<FEXUnixLib_GetHostPageSize*>(_Args)->Size = static_cast<uint64_t>(Size);
++  return STATUS_SUCCESS;
++}
++
+ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
+   FEXUnixLib_SetHardwareTSOControlHandler,
+   FEXUnixLib_SetKernelUnalignedAtomicControlHandler,
+@@ -248,6 +259,7 @@ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
+   FEXUnixLib_GetPIDHandler,
+   FEXUnixLib_JITWriteProtectSupportedHandler,
+   FEXUnixLib_JITWriteProtectHandler,
++  FEXUnixLib_GetHostPageSizeHandler,
+ };
+ 
+ static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == ToUnderlying(FEXUnixLibFunctions::MAX));
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.h b/Source/Windows/UnixLib/FEXUnixLib.h
+index 20e242f4a..c14103dc7 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.h
++++ b/Source/Windows/UnixLib/FEXUnixLib.h
+@@ -14,6 +14,7 @@ enum class FEXUnixLibFunctions : uint32_t {
+   GetPID,
+   JITWriteProtectSupported,
+   JITWriteProtect,
++  GetHostPageSize,
+   MAX,
+ };
+ 
+@@ -72,3 +73,8 @@ struct FEXUnixLib_JITWriteProtect {
+   bool Protect;
+ };
+ static_assert(sizeof(FEXUnixLib_JITWriteProtect) == 1);
++
++struct FEXUnixLib_GetHostPageSize {
++  uint64_t Size;
++};
++static_assert(sizeof(FEXUnixLib_GetHostPageSize) == 8);
+-- 
+2.56.1
+
