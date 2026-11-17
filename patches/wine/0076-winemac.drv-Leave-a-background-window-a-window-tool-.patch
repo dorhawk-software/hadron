@@ -1,0 +1,60 @@
+From 91065caea568f87611340f0eb7b55791f100eb75 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 18:27:44 +0100
+Subject: [PATCH] winemac.drv: Leave a background window a window tool tiles
+ maximized.
+
+From Codex's review of Broyojo/hadron#182: restoring a window in the
+background with SW_SHOWNOACTIVATE passes over a program's own
+SC_RESTORE handling. Only the window in front is restored now, through
+SC_RESTORE; one in the background keeps the frame and stays maximized,
+as on Hadron 0.3.3. Window tools such as Rectangle act on the window in
+front.
+
+Measured with own-frame hold-maximized second and a tool's left half at
+192 DPI: no activation change, the window behind stays maximized; a
+single window in front is restored to the same frame as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/window.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index cac6ca662a..3c59bad5bb 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -2012,6 +2012,15 @@ void macdrv_window_frame_settled(HWND hwnd)
+      * left; a window tool's halves, thirds and other tiles aren't. */
+     if (!end_fills && (same_display || !moved_whole(&visible, &start, &start_info, &end_info)))
+     {
++        /* Only the window in front: the title bar's restore activates a window, and a window tool
++         * may arrange one in the background (it sets every window's frame without activating the
++         * app). A window in the background keeps the frame and stays maximized. */
++        if (hwnd != NtUserGetForegroundWindow())
++        {
++            TRACE("%p is in the background: leaving it maximized\n", hwnd);
++            NtUserSetThreadDpiAwarenessContext(context);
++            return;
++        }
+         TRACE("%p no longer fills a display: it restores to %s\n", hwnd, wine_dbgstr_rect(&window));
+         NtUserSetRawWindowPos(hwnd, window, 0, TRUE);
+         NtUserSetThreadDpiAwarenessContext(context);
+@@ -2019,12 +2028,8 @@ void macdrv_window_frame_settled(HWND hwnd)
+          * dragged or snapped: it comes between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE, so a program
+          * that saves its placement at the end of one hears it. */
+         send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+-        /* restored now, not when a posted command arrives, to place it below. A window tool may
+-         * arrange a window in the background: only the one in front takes the title bar's
+-         * restore, which activates it; any other is restored where it is. */
+-        if (hwnd != NtUserGetForegroundWindow())
+-            NtUserShowWindow(hwnd, SW_SHOWNOACTIVATE);
+-        else if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED))
++        /* restored now, not when a posted command arrives, to place it below */
++        if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED))
+             send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+ 
+         /* Restored, the window has the title bar and borders of a window that isn't maximized, on
+-- 
+2.56.1
+
