@@ -1,0 +1,45 @@
+From 5024d7e1e81c277182e80d4af8b14d6a2108a0ee Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 18:17:58 +0100
+Subject: [PATCH] winemac.drv: Restore a background window a window tool tiles
+ without activating it.
+
+From Codex's review of Broyojo/hadron#182. A window tool sets every
+window's frame without activating the app; the restore once a frame
+settles went through SC_RESTORE, whose SW_RESTORE activates, so a
+maximized window behind another of the same program took activation
+from it. Only the window in front takes SC_RESTORE now; any other is
+restored with SW_SHOWNOACTIVATE.
+
+Measured with own-frame hold-maximized second and a tool's left half at
+192 DPI: before, the window behind was activated and the one in front
+deactivated; after, neither, with the same restored frame. The
+single-window case is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/window.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 9cfe104b55..cac6ca662a 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -2019,8 +2019,12 @@ void macdrv_window_frame_settled(HWND hwnd)
+          * dragged or snapped: it comes between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE, so a program
+          * that saves its placement at the end of one hears it. */
+         send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+-        /* restored now, not when a posted command arrives, to place it below */
+-        if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED))
++        /* restored now, not when a posted command arrives, to place it below. A window tool may
++         * arrange a window in the background: only the one in front takes the title bar's
++         * restore, which activates it; any other is restored where it is. */
++        if (hwnd != NtUserGetForegroundWindow())
++            NtUserShowWindow(hwnd, SW_SHOWNOACTIVATE);
++        else if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED))
+             send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+ 
+         /* Restored, the window has the title bar and borders of a window that isn't maximized, on
+-- 
+2.56.1
+
