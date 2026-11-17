@@ -2007,3 +2007,21 @@ Tests: `tests/win/own-frame.c` (`strip`, `monitor-minmax`), `tests/win/win-info.
 `tests/win/cursor-size.c` (`file`, `ani`, `cache`), `tests/mac/ax-window.swift`,
 `tests/mac/drag-pid.swift`. The measurements are in the Hadron pull requests' findings entries
 (#63 to #67). #174 (the sideways wheel) stays in this fork only, as Hadron asked.
+
+## An x64 program couldn't print on ARM64 (fixed, Gentes fork, patch 0077)
+
+Enterprise Architect (x64) said "An error has occurred and the print job could not be started";
+the Mac's printer was listed. An x64 program runs in the native process (ARM64EC), and wineboot
+installs only the native printing environment there, as on Windows: `wineps.drv` and
+`winprint.dll` go to `spool\drivers\arm64\3` and `spool\prtprocs\arm64`. winspool, localspl and
+gdi32 chose their environment by `__x86_64__`, which ARM64EC code defines too, so the program looked
+in the `x64` folders, which hold only the printer's PPD: `CreateDC` and `StartDoc` failed with
+error 126 (module not found). ARM64EC code now uses the native environment, whose driver and
+processor are ARM64X builds.
+
+`tests/win/print-check.c`, in an x64 prefix with a CUPS printer: before, driver folder `x64`,
+`wineps.drv` missing, `CreateDC` error 126; after, driver folder `arm64` with `wineps.drv`,
+`CreateDC` opens and `StartDoc` starts a job, which it cancels at once (nothing is printed).
+EA's print preview and print dialog work.
+
+Open: images with transparency print on black in EA's print preview (seen, not yet looked into).

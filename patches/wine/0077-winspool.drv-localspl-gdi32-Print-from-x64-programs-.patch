@@ -1,0 +1,79 @@
+From 602ff94d3febd0acc040dcf6a4a57b47071f3dd5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 19:20:55 +0100
+Subject: [PATCH] winspool.drv, localspl, gdi32: Print from x64 programs on
+ ARM64.
+
+An x64 program on ARM64 runs in the native process (ARM64EC), and
+wineboot installs only the native printing environment there, as on
+Windows: wineps.drv and winprint.dll go to spool\drivers\arm64\3 and
+spool\prtprocs\arm64. But winspool, localspl and gdi32 chose their
+environment by __x86_64__, which ARM64EC code defines too, so an x64
+program looked for the driver in spool\drivers\x64\3 and the print
+processor in spool\prtprocs\x64, which hold neither: CreateDC and
+StartDoc failed with ERROR_MOD_NOT_FOUND, and Enterprise Architect
+said "the print job could not be started".
+
+ARM64EC code now uses the native environment, whose driver and print
+processor are ARM64X builds that load in either code.
+
+Measured with Gentes' harness print-check in an x64 prefix on an M-series
+Mac with a CUPS printer: before, driver folder x64 with no wineps.drv,
+CreateDC error 126; after, driver folder arm64 with wineps.drv, CreateDC
+opens and StartDoc starts a job (cancelled at once). Enterprise
+Architect's print preview and print dialog work.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/gdi32/dc.c          | 3 +++
+ dlls/localspl/provider.c | 4 ++++
+ dlls/winspool.drv/info.c | 4 ++++
+ 3 files changed, 11 insertions(+)
+
+diff --git a/dlls/gdi32/dc.c b/dlls/gdi32/dc.c
+index adfcd5195d..183abde65b 100644
+--- a/dlls/gdi32/dc.c
++++ b/dlls/gdi32/dc.c
+@@ -198,6 +198,9 @@ static struct graphics_driver *create_driver( HMODULE module )
+ 
+ #ifdef __i386__
+ static const WCHAR printer_env[] = L"w32x86";
++#elif defined __arm64ec__
++/* x64 code on ARM64 uses the native printer environment (winspool's env_arch) */
++static const WCHAR printer_env[] = L"arm64";
+ #elif defined __x86_64__
+ static const WCHAR printer_env[] = L"x64";
+ #elif defined __arm__
+diff --git a/dlls/localspl/provider.c b/dlls/localspl/provider.c
+index e318736e09..b8ea99379d 100644
+--- a/dlls/localspl/provider.c
++++ b/dlls/localspl/provider.c
+@@ -323,6 +323,10 @@ static const printenv_t * const all_printenv[] = {&env_x86, &env_x64, &env_ia64,
+ 
+ #ifdef __i386__
+ #define env_arch env_x86
++#elif defined __arm64ec__
++/* x64 code on ARM64 runs in the native process, as on Windows: the printer environment is the
++ * native one, whose driver and print processor are built for both (ARM64X). */
++#define env_arch env_arm64
+ #elif defined __x86_64__
+ #define env_arch env_x64
+ #elif defined __arm__
+diff --git a/dlls/winspool.drv/info.c b/dlls/winspool.drv/info.c
+index 6170dc7f90..3993579e49 100644
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -136,6 +136,10 @@ static const printenv_t * const all_printenv[] = { &env_x86, &env_x64, &env_arm,
+ 
+ #ifdef __i386__
+ #define env_arch env_x86
++#elif defined __arm64ec__
++/* x64 code on ARM64 runs in the native process, as on Windows: the printer environment is the
++ * native one, whose driver and print processor are built for both (ARM64X). */
++#define env_arch env_arm64
+ #elif defined __x86_64__
+ #define env_arch env_x64
+ #elif defined __arm__
+-- 
+2.56.1
+
