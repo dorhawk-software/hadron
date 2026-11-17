@@ -1,0 +1,41 @@
+From be2f2dd63f8f05194bf955865b55e5f029f337ab Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 22:00:16 +0100
+Subject: [PATCH] winemac.drv: Quit with Command-Q when Command is Ctrl.
+
+With LeftCommandIsCtrl or RightCommandIsCtrl, Command-Q reached the
+program as Ctrl-Q, which most Windows programs ignore, so the Mac's
+Quit shortcut did nothing; Quit stayed on Option-Command-Q. Command-Q
+now quits, as in every Mac app, and the program is still asked to
+close (it can offer to save). Without the option nothing changes, so
+Command-Q stays free for the program's Alt-Q.
+
+Tried with Enterprise Architect under Gentes: Command-Q closes it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/cocoa_app.m | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 0f4034b883..4615b9b7d2 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -270,7 +270,13 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             else
+                 title = WineLocalizedString(STRING_MENU_ITEM_QUIT);
+             item = [submenu addItemWithTitle:title action:@selector(terminate:) keyEquivalent:@"q"];
+-            [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
++            /* With Command as Ctrl, Command-Q quits as in every Mac app instead of reaching the
++               program as Ctrl-Q, which most Windows programs ignore; otherwise it stays free for
++               the program's Alt-Q. */
++            if (left_command_is_ctrl || right_command_is_ctrl)
++                [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
++            else
++                [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+             item = [[[NSMenuItem alloc] init] autorelease];
+             [item setTitle:WineLocalizedString(STRING_MENU_WINE)];
+             [item setSubmenu:submenu];
+-- 
+2.56.1
+
