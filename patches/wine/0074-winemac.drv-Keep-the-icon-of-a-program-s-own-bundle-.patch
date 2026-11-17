@@ -1,0 +1,44 @@
+From f4854cb2aae7eac601f815f968fca90312af565d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 18:08:20 +0100
+Subject: [PATCH] winemac.drv: Keep the icon of a program's own bundle in the
+ Dock.
+
+A launcher that starts a program from a bundle of its own with an icon
+may draw that icon as it wants the program shown: Gentes puts each
+app's Windows icon on a tile in the app's own tint. winemac replaced
+it with the executable's icon when the first window appeared, so the
+Dock showed the bare Windows icon. With CFBundleIconFile pointing at
+an image the bundle holds, the application icon is left as the
+bundle's; without one, as before.
+
+Measured with Enterprise Architect 17.2 through Gentes: the bundle's
+tinted icon stays; before, the owner saw the bare EA icon in the Dock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/cocoa_app.m | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index af8be4857e..0f4034b883 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -1151,6 +1151,14 @@ - (void) setCursorWithFrames:(NSArray*)frames
+     - (void) setApplicationIconFromCGImageArray:(NSArray*)images
+     {
+         NSImage* nsimage = nil;
++        NSBundle* bundle = [NSBundle mainBundle];
++        NSString* iconFile = [bundle objectForInfoDictionaryKey:@"CFBundleIconFile"];
++
++        /* A program started from a bundle of its own with an icon (a launcher's, which may draw the
++         * program's icon as it wants it in the Dock) keeps that icon: the default image is the
++         * bundle's. */
++        if ([iconFile isKindOfClass:[NSString class]] && [bundle pathForImageResource:iconFile])
++            images = nil;
+ 
+         if ([images count])
+         {
+-- 
+2.56.1
+

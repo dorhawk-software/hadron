@@ -210,7 +210,15 @@ if [ "$(readlink "$wine" 2>/dev/null)" != "$loader" ] || ! grep -q LSSupportsGam
 </plist>
 EOF
 fi
-if [ ! -f "$app/Contents/Resources/icon.icns" ] && [ -x "$ROOT/dist/bin/hadron-icon" ]; then
+# A launcher may give the bundle an icon of its own (HADRON_APP_ICON, an .icns): Gentes gives each
+# app its icon on a tile in the app's own tint. It replaces the bundle's whenever it differs, and the
+# bundle's new date makes the Dock read it again.
+if [ -n "${HADRON_APP_ICON:-}" ] && [ -f "$HADRON_APP_ICON" ]; then
+    if ! cmp -s "$HADRON_APP_ICON" "$app/Contents/Resources/icon.icns"; then
+        cp "$HADRON_APP_ICON" "$app/Contents/Resources/icon.icns.new" &&
+            mv -f "$app/Contents/Resources/icon.icns.new" "$app/Contents/Resources/icon.icns" && touch "$app"
+    fi
+elif [ ! -f "$app/Contents/Resources/icon.icns" ] && [ -x "$ROOT/dist/bin/hadron-icon" ]; then
     "$ROOT/dist/bin/hadron-icon" "$exe" "$app/Contents/Resources/icon.icns" 2>/dev/null || true
 fi
 [ -x "$wine" ] || wine="$ROOT/dist/bin/wine"
