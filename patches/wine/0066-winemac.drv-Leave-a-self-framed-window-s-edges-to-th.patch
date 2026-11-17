@@ -1,0 +1,139 @@
+From 0fb4bac20dd99752d317aa8ee6180c4ee1fe0b7b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 09:31:33 +0100
+Subject: [PATCH 66/71] winemac.drv: Leave a self-framed window's edges to the
+ app, and compare its region at its DPI.
+
+From Hadron's review of 0050 and 0051 (Broyojo/hadron#171). 0050 made
+the Cocoa window of a window that draws its own frame resizable, so
+AppKit's edge zones resized it from every edge, even where the app
+answers HTCLIENT (CEF, Qt, launchers), and a Wine-framed WS_POPUP |
+WS_THICKFRAME became eligible for a fullscreen Space. Keep the Cocoa
+window borderless and answer Accessibility's size requests ourselves:
+window tools still resize it, and a drag at its edge goes to the app's
+WM_NCHITTEST, as on Windows.
+
+0051 compared the window's region, which is in the window's coordinates
+at its DPI, with the driver's raw-pixel window rect, so a DPI-unaware
+ribbon app at 192 DPI in Retina mode wasn't resizable (measured). Compare
+it with the window rect at the window's DPI.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/cocoa_window.m | 48 +++++++++++++++++++++++++++++----
+ dlls/winemac.drv/window.c       | 20 ++++++++------
+ 2 files changed, 55 insertions(+), 13 deletions(-)
+
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index b0f9d448a1..0d11558246 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -77,11 +77,7 @@ static NSUInteger style_mask_for_features(const struct macdrv_window_features* w
+         if (wf->resizable || wf->maximize_button) style_mask |= NSWindowStyleMaskResizable;
+         if (wf->utility) style_mask |= NSWindowStyleMaskUtilityWindow;
+     }
+-    else
+-    {
+-        style_mask = NSWindowStyleMaskBorderless;
+-        if (wf->resizable) style_mask |= NSWindowStyleMaskResizable;
+-    }
++    else style_mask = NSWindowStyleMaskBorderless;
+ 
+     if (wf->prevents_app_activation) style_mask |= NSWindowStyleMaskNonactivatingPanel;
+ 
+@@ -1061,6 +1057,48 @@ - (BOOL) preventResizing
+         return ([self styleMask] & NSWindowStyleMaskResizable) && (disabled || !resizable || preventForClipping);
+     }
+ 
++    /* A window that draws its own frame is borderless to AppKit, so AppKit doesn't resize it from
++     * its edges: those are the app's, through WM_NCHITTEST, as on Windows. AppKit also refuses to
++     * let window tools resize it through Accessibility, but its sizing border lets the user resize
++     * it, so they may. */
++    - (BOOL) allowsAccessibilityResize
++    {
++        BOOL preventForClipping = cursor_clipping_locks_windows && [[WineApplicationController sharedController] clippingCursor];
++        return !([self styleMask] & NSWindowStyleMaskResizable) && resizable && !disabled && !preventForClipping;
++    }
++
++    /* AppKit answers other apps' Accessibility requests for a window through these. */
++    - (BOOL) accessibilityIsAttributeSettable:(NSString*)attribute
++    {
++        if ([attribute isEqualToString:NSAccessibilitySizeAttribute] && [self allowsAccessibilityResize])
++            return YES;
++        return [super accessibilityIsAttributeSettable:attribute];
++    }
++
++    - (void) accessibilitySetValue:(id)value forAttribute:(NSString*)attribute
++    {
++        if ([attribute isEqualToString:NSAccessibilitySizeAttribute] && [self allowsAccessibilityResize] &&
++            [value isKindOfClass:[NSValue class]])
++            [self resizeForAccessibility:[value sizeValue]];
++        else
++            [super accessibilitySetValue:value forAttribute:attribute];
++    }
++
++    - (void) resizeForAccessibility:(NSSize)size
++    {
++        NSRect frame = [self frame], content;
++
++        content = [self contentRectForFrameRect:NSMakeRect(0, 0, size.width, size.height)];
++        content.size.width = MIN(MAX(content.size.width, savedContentMinSize.width), savedContentMaxSize.width);
++        content.size.height = MIN(MAX(content.size.height, savedContentMinSize.height), savedContentMaxSize.height);
++        size = [self frameRectForContentRect:content].size;
++
++        /* Keep the top left corner where it is, as AppKit does for a resizable window. */
++        frame.origin.y = NSMaxY(frame) - size.height;
++        frame.size = size;
++        [self setFrame:frame display:YES];
++    }
++
+     - (BOOL) allowsMovingWithMaximized:(BOOL)inMaximized
+     {
+         if (allow_immovable_windows && (disabled || inMaximized))
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 59c88dba97..1420bbb3d9 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -84,17 +84,21 @@ static struct macdrv_window_features get_window_features_for_style(DWORD style,
+  *
+  * Whether the window's region is one rectangle that covers the whole window. Ribbon libraries set
+  * such a region: it doesn't change the window's outline, so it isn't a shape.
++ *
++ * The region is in the window's own coordinates, at its DPI, so it is compared with the window's
++ * rect at that DPI, never with the driver's rects, which are in raw monitor pixels.
+  */
+-static BOOL region_covers_window(HWND hwnd, const RECT *window)
++static BOOL region_covers_window(HWND hwnd)
+ {
+     HRGN region = NtGdiCreateRectRgn(0, 0, 0, 0);
+-    RECT box;
++    RECT box, window;
+     BOOL ret = FALSE;
+ 
+     if (!region) return FALSE;
+-    if (NtUserGetWindowRgnEx(hwnd, region, 0) != ERROR && NtGdiGetRgnBox(region, &box) == SIMPLEREGION)
+-        ret = box.left <= 0 && box.top <= 0 && box.right >= window->right - window->left &&
+-              box.bottom >= window->bottom - window->top;
++    if (NtUserGetWindowRgnEx(hwnd, region, 0) == SIMPLEREGION && NtGdiGetRgnBox(region, &box) == SIMPLEREGION &&
++        NtUserGetWindowRect(hwnd, &window, NtUserGetDpiForWindow(hwnd)))
++        ret = box.left <= 0 && box.top <= 0 && box.right >= window.right - window.left &&
++              box.bottom >= window.bottom - window.top;
+     NtGdiDeleteObjectApp(region);
+     return ret;
+ }
+@@ -160,9 +164,9 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
+     if (data->own_frame)
+     {
+         /* The app draws its own frame, but a sizing border still lets the user resize the
+-         * window: let macOS and its window tools resize it too. */
+-        if ((style & WS_THICKFRAME) &&
+-            (!data->shaped || region_covers_window(data->hwnd, &data->rects.window)))
++         * window. The Cocoa window stays borderless, so its edges are the app's, as on Windows
++         * (WM_NCHITTEST); resizable lets window tools resize it through Accessibility. */
++        if ((style & WS_THICKFRAME) && (!data->shaped || region_covers_window(data->hwnd)))
+             wf.resizable = TRUE;
+         return wf;
+     }
+-- 
+2.56.1
+

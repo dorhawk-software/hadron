@@ -1,0 +1,51 @@
+From aec2bb42017e1688709bebd8daf393e3fac941de Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 16:49:27 +0100
+Subject: [PATCH 70/71] winemac.drv: Report the move Cocoa makes on a style
+ change as Cocoa's own.
+
+From the simpler window-tool patch for Hadron (Broyojo/hadron#182). A
+window that loses its title bar as it is maximized (a self-framed
+window's first maximize) was moved down by the bar's height by Cocoa,
+and the move was reported as the user's: it started a window-tool
+gesture. Like an adjustment of a frame Wine set, it now comes with
+skip_size_move_loop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/cocoa_window.m | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 0d11558246..3f70d11d8b 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -1182,6 +1182,7 @@ - (void) setWindowFeatures:(const struct macdrv_window_features*)wf
+ 
+         if (newStyle != currentStyle)
+         {
++            BOOL wasIgnoringResize = ignore_windowResize;
+             NSString* title = [[[self title] copy] autorelease];
+             BOOL showingButtons = (currentStyle & (NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)) != 0;
+             BOOL shouldShowButtons = (newStyle & (NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)) != 0;
+@@ -1192,9 +1193,17 @@ - (void) setWindowFeatures:(const struct macdrv_window_features*)wf
+                 // just NSWindowStyleMaskTitled, the window buttons should disappear rather
+                 // than just being disabled.  But they don't.  Similarly in reverse.
+                 // The workaround is to also toggle NSWindowStyleMaskClosable at the same time.
++                ignore_windowResize = TRUE;
+                 [self setStyleMask:newStyle ^ NSWindowStyleMaskClosable];
+             }
++            /* Cocoa may move the window as its style changes, to keep a title bar it gains on
++               screen, or the window's content where it was when it loses one. That is Cocoa's
++               adjustment of what Wine set, reported as such (skipSizeMove), as after setFrame. */
++            ignore_windowResize = TRUE;
+             [self setStyleMask:newStyle];
++            ignore_windowResize = wasIgnoringResize;
++            if (!ignore_windowResize && [self isOrderedIn])
++                [self windowDidResize:nil skipSizeMove:TRUE];
+ 
+             BOOL isNonActivating = (currentStyle & NSWindowStyleMaskNonactivatingPanel) != 0;
+             BOOL shouldBeNonActivating = (newStyle & NSWindowStyleMaskNonactivatingPanel) != 0;
+-- 
+2.56.1
+

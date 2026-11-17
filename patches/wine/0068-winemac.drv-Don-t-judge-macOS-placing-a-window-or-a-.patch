@@ -1,0 +1,68 @@
+From 1843adae68cce7f630e3421fee3d6e4d4aba1b21 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 17 Nov 2026 09:33:25 +0100
+Subject: [PATCH 68/71] winemac.drv: Don't judge macOS placing a window, or a
+ taller tile, as a maximize moved.
+
+From Hadron's review of 0052 (Broyojo/hadron#172), two cases it judged
+wrong:
+
+- A maximized window shown on a display that isn't the main one, which
+  macOS moves below that display's menu bar, started a gesture as if a
+  window tool had moved it. A frame change that comes with
+  skip_size_move_loop is macOS placing the window, and starts none.
+- On a much taller display, a full-width tile of about 80% of its
+  height counted as "moved whole", because it was at least as tall as
+  the window had been. A window as wide as the new work area now counts
+  only when its height is within a title bar of what it was.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/window.c | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 1420bbb3d9..dd23cdd49c 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1862,11 +1862,13 @@ static BOOL moved_whole(const RECT *visible, const RECT *start, const MONITORINF
+     double width = (visible->right - visible->left) / scale, height = (visible->bottom - visible->top) / scale;
+     double start_width = (start->right - start->left) / start_scale, start_height = (start->bottom - start->top) / start_scale;
+ 
+-    /* the same width; the height may differ by a title bar, as a display of another DPI gives the
+-     * window's title bar and borders another size */
+-    if (fabs(width - start_width) <= 2 && fabs(height - start_height) <= 40) return TRUE;
+-    return visible->left <= end_info->rcWork.left + points(visible, 2) &&
+-           visible->right >= end_info->rcWork.right - points(visible, 2) && height >= start_height - 2;
++    /* the same width, or as wide as the new work area; the height may differ by a title bar, as a
++     * display of another DPI gives the window's title bar and borders another size. A window that
++     * is any taller is a window tool's tile of a taller display, not a maximize macOS held short. */
++    if (fabs(height - start_height) > 40) return FALSE;
++    return fabs(width - start_width) <= 2 ||
++           (visible->left <= end_info->rcWork.left + points(visible, 2) &&
++            visible->right >= end_info->rcWork.right - points(visible, 2));
+ }
+ 
+ 
+@@ -1905,6 +1907,7 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
+      * window's frame: macdrv_window_frame_settled judges the result once the frame stops changing. */
+     if (!EqualRect(&visible, &old_visible) && !event->window_frame_changed.fullscreen &&
+         !event->window_frame_changed.in_resize && !being_dragged && !data->frame_gesture &&
++        !event->window_frame_changed.skip_size_move_loop &&
+         (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MAXIMIZE))
+     {
+         data->frame_gesture = TRUE;
+@@ -2028,8 +2031,8 @@ void macdrv_window_frame_settled(HWND hwnd)
+     /* Moved to another display, the window may not fill it and still be meant to: a window tool may
+      * move it without a new size, and macOS may hold a window's height to the display it leaves
+      * (never its width), so a "maximize on the next display" can come out short. Such a window is
+-     * the size it was, or as wide as the new work area and at least as tall as it was; a window
+-     * tool's halves, thirds and other tiles aren't. */
++     * the size it was, or as wide as the new work area and as tall as it was, give or take a title
++     * bar; a window tool's halves, thirds and other tiles aren't. */
+     if (!end_fills && (same_display || !moved_whole(&visible, &start, &end_info)))
+     {
+         TRACE("%p no longer fills a display: it restores to %s\n", hwnd, wine_dbgstr_rect(&window));
+-- 
+2.56.1
+

@@ -1980,3 +1980,30 @@ automated test: mouse events that a command-line tool posts (`CGEventPost` at
 `kCGHIDEventTap`, or `CGEventPostToPid`) moved the pointer, and a posted click activated the
 test program, but winemac got none of them, neither the moves nor the click (`+cursor` traced
 no `macdrv_mouse_moved` or `macdrv_mouse_button`). Why was not found.
+
+## Hadron's review of the window and cursor patches (Gentes fork, patches 0066 to 0071)
+
+Hadron reviewed what Gentes sent (Broyojo/hadron#171 to #175). The fork takes every fix asked for,
+on top of its queue:
+
+- 0066 (#171): a self-framed window's Cocoa window stays borderless, so its edges are the
+  program's (`WM_NCHITTEST`), and window tools resize it through Accessibility; its region is
+  compared with its window rect at its DPI.
+- 0067 (#175, now #181): every cursor at 96 / DPI points per pixel in Retina mode, scaled outside
+  the cursor cache.
+- 0068 and 0071: the fork keeps its judgment of a window tool's change to a maximized window, which
+  Hadron declined (#172; Hadron may take the simpler #182). macOS placing a window
+  (`skip_size_move_loop`) starts no gesture, and a full-width window on another display counts
+  as a maximize moved there only when its bottom is held to the height of the display it left.
+  Every Mac-side frame of a self-framed maximized window is its whole window. Still not told
+  apart: a full-width tile of a taller display that macOS holds to the same frame as a maximize.
+- 0069 (#173, now #183): only a window at the default maximize's place is clipped to its area,
+  so a game's borderless fullscreen isn't cropped; winemac tells a self-framed window without
+  monitor queries.
+- 0070 (from #182): the move Cocoa makes when a window's style changes is reported as Cocoa's
+  own, so a self-framed window's first maximize starts no gesture.
+
+Tests: `tests/win/own-frame.c` (`strip`, `monitor-minmax`), `tests/win/win-info.c`,
+`tests/win/cursor-size.c` (`file`, `ani`, `cache`), `tests/mac/ax-window.swift`,
+`tests/mac/drag-pid.swift`. The measurements are in the Hadron pull requests' findings entries
+(#63 to #67). #174 (the sideways wheel) stays in this fork only, as Hadron asked.
