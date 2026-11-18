@@ -1,0 +1,160 @@
+From b18333457e60c8562aec763a9990ba750b1ca856 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Wed, 18 Nov 2026 14:14:39 +0100
+Subject: [PATCH] winemac.drv: Drag a dialog smoothly, out of its owner for the
+ drag.
+
+An owned window (a dialog) is a Cocoa child of its owner, and macOS
+drags a child window from the app's main thread, a step at a time, where
+the window server drags a window on its own smoothly. FileZilla's Site
+Manager dragged choppily while FileZilla's main window moved smoothly.
+
+When macOS says a drag starts, the child now leaves its parent, one
+window level above it (the click that started the drag brought the
+parent over it otherwise), and minimumLevelForActive keeps it there for
+adjustWindowLevels. When the drag ends it joins its parent again on the
+next turn of the main loop (attached at once, the next click on it
+brought the parent over it), as a child or, if either was hidden
+meanwhile, a latent child. An order-out during the drag puts it back
+first, so it becomes a latent child as any other.
+
+Tested on macOS 26 with a small AppKit program (a parent and children
+detached at different moments: only this one stayed above the parent
+through press, drag and release, and dragged smoothly) and with
+FileZilla 3.72.1's Site Manager, which now drags smoothly and stays
+above FileZilla's window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/cocoa_app.m    | 10 ++++++++
+ dlls/winemac.drv/cocoa_window.h |  5 ++++
+ dlls/winemac.drv/cocoa_window.m | 41 +++++++++++++++++++++++++++++++++
+ 3 files changed, 56 insertions(+)
+
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 71da3f1dc2..90a43484b9 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -2054,7 +2054,10 @@ - (void) setupObservations
+                     usingBlock:^(NSNotification *note){
+             NSWindow* window = [note object];
+             if ([window isKindOfClass:[WineWindow class]])
++            {
++                [(WineWindow *)window detachForDrag];
+                 [self handleWindowDrag:(WineWindow *)window begin:YES];
++            }
+         }];
+ 
+         [nc addObserverForName:NSWindowDidEndDraggingNotification
+@@ -2063,7 +2066,14 @@ - (void) setupObservations
+                     usingBlock:^(NSNotification *note){
+             NSWindow* window = [note object];
+             if ([window isKindOfClass:[WineWindow class]])
++            {
+                 [self handleWindowDrag:(WineWindow *)window begin:NO];
++                /* Once macOS has finished the drag: attached sooner, the next click on the
++                 * window brought its parent over it. */
++                dispatch_async(dispatch_get_main_queue(), ^{
++                    [(WineWindow *)window reattachAfterDrag];
++                });
++            }
+         }];
+ 
+         [nc addObserver:self
+diff --git a/dlls/winemac.drv/cocoa_window.h b/dlls/winemac.drv/cocoa_window.h
+index af7e16a0e3..e34c79c067 100644
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -42,6 +42,8 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+     BOOL closing;
+     WineWindow* latentParentWindow;
+     NSMutableArray* latentChildWindows;
++    WineWindow* dragParent;
++    NSInteger levelBeforeDrag;
+ 
+     void* hwnd;
+     WineEventQueue* queue;
+@@ -111,4 +113,7 @@ - (void) updateForCursorClipping;
+ 
+     - (void) setRetinaMode:(BOOL)mode;
+ 
++    - (void) detachForDrag;
++    - (void) reattachAfterDrag;
++
+ @end
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 733d6d7f58..476701f66c 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -1048,6 +1048,7 @@ - (void) dealloc
+         [queue release];
+         [latentChildWindows release];
+         [latentParentWindow release];
++        [dragParent release];
+         [contentViewMaskLayer release];
+         [super dealloc];
+     }
+@@ -1255,6 +1256,11 @@ - (NSInteger) minimumLevelForActive:(BOOL)active
+         else
+             level = NSNormalWindowLevel;
+ 
++        /* Out of its parent for a drag (detachForDrag): above the parent, or the
++         * click that started the drag brings the parent over it. */
++        if (dragParent && level <= [dragParent level])
++            level = [dragParent level] + 1;
++
+         if (active)
+         {
+             BOOL captured;
+@@ -1565,6 +1571,39 @@ - (BOOL) becameEligibleParentOrChild
+         return reordered;
+     }
+ 
++    /* An owned window (a dialog) is a Cocoa child of its owner. macOS drags a child window
++     * from the app's main thread, a step at a time, so it moves choppily, where the window
++     * server drags a window on its own smoothly (FileZilla's Site Manager against its main
++     * window). So for its drag a child leaves its parent, one level above it so the click
++     * that started the drag can't bring the parent over it, and joins it again when the drag
++     * ends (reattachAfterDrag). */
++    - (void) detachForDrag
++    {
++        WineWindow* parent = (WineWindow*)[self parentWindow];
++
++        if (dragParent || ![parent isKindOfClass:[WineWindow class]]) return;
++
++        dragParent = [parent retain];
++        levelBeforeDrag = [self level];
++        [parent removeChildWindow:self];
++        [self setLevel:[parent level] + 1];
++    }
++
++    - (void) reattachAfterDrag
++    {
++        WineWindow* parent = dragParent;
++
++        if (!parent) return;
++
++        dragParent = nil;
++        [self setLevel:levelBeforeDrag];
++        /* As a child again, or a latent one if either was hidden meanwhile. */
++        if (![self parentWindow] && !latentParentWindow)
++            [parent addChildWineWindow:self];
++        [parent release];
++        [[WineApplicationController sharedController] adjustWindowLevels];
++    }
++
+     - (void) becameIneligibleChild
+     {
+         WineWindow* parent = (WineWindow*)[self parentWindow];
+@@ -1858,6 +1897,8 @@ - (void) doOrderOut
+ 
+         [self endWindowDragging];
+         [controller windowWillOrderOut:self];
++        /* Back with its parent first, so it becomes a latent child as any other. */
++        [self reattachAfterDrag];
+ 
+         if (enteringFullScreen || exitingFullScreen)
+         {
+-- 
+2.56.1
+
