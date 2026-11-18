@@ -2051,3 +2051,21 @@ with its picture, and a click on it brings it back maximized; the trace shows th
 before and after. Not covered by a test: the restore that went wrong comes from the Dock, which a
 probe can't click; `WM_SYSCOMMAND` SC_MINIMIZE then SC_RESTORE from inside Windows restored
 correctly before the fix too.
+
+## Clicks on a display left of or above the main one (fixed, Gentes fork, patch 0082)
+
+Enterprise Architect took no clicks on an external monitor arranged above a MacBook's display,
+and worked when moved back. Every point on such a display has a negative coordinate, and the
+server's `scale_dpi()` (server/user.h, since upstream's 2587d2822c made the DPI a ratio) took the
+ratio's terms as `unsigned int`: `val * num` for a negative `val` was done unsigned, so -210 at
+96/96 became (2^32 - 20160 - 48) / 96 = 44739032. The server's hit test (`is_point_in_window`)
+found no window under the click, and another process read EA's rect as 44739032,44736422 to
+4910,0 (tests/win/win-info.c). Upstream's master still has it. The terms are now signed 64-bit
+(patch 0082).
+
+Test: `tests/win/negative-coords.c` puts a popup inside each display left of or above the main
+one and asks the server for the window under its centre. Before: no window (exit 1); after: the
+popup (exit 0). With no display there it says so and exits 2, as a window off every display is
+cropped to the virtual screen and can't be clicked anyway. Also checked on the owner's Mac (a
+2560x1440-point monitor at -105,-1440 above the built-in display): EA's rect read -210,-2820 to
+4910,0, a double click on its title strip restored it, and the owner found it responsive.

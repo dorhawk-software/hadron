@@ -1,0 +1,40 @@
+From d00f4230a56c8acbba03bac4c3f0aa28663f8d0f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Wed, 18 Nov 2026 07:54:55 +0100
+Subject: [PATCH] server: Scale a negative coordinate with signed arithmetic.
+
+scale_dpi() took the ratio's terms as unsigned int, so val * num for a
+negative val was done unsigned: a point left of or above the primary
+monitor, -210 at 96/96, became (2^32 - 20160 - 48) / 96 = 44739032.
+The server's hit test (is_point_in_window) then found no window under
+a click on a display placed there, and get_window_rectangles gave other
+processes garbage left and top edges. Enterprise Architect on a monitor
+above a MacBook's display took no clicks at all.
+
+Signed 64-bit terms keep the sign; the struct ratio's 16-bit terms
+multiply within range. tests/win/negative-coords.c in Gentes' Hadron
+fails without this (no window under a point on that display) and
+passes with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ server/user.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/server/user.h b/server/user.h
+index f1a1f07df6..0d965f460e 100644
+--- a/server/user.h
++++ b/server/user.h
+@@ -234,7 +234,8 @@ static inline int point_in_rect( const struct rectangle *rect, int x, int y )
+ 
+ static inline int scale_dpi( int val, struct ratio dpi_from, struct ratio dpi_to )
+ {
+-    unsigned int num = dpi_to.num * dpi_from.den, den = dpi_from.num * dpi_to.den;
++    /* signed: a point left of or above the primary monitor is negative */
++    long long num = (long long)dpi_to.num * dpi_from.den, den = (long long)dpi_from.num * dpi_to.den;
+     if (val >= 0) return (val * num + (den / 2)) / den;
+     return (val * num - (den / 2)) / den;
+ }
+-- 
+2.56.1
+
