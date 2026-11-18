@@ -2069,3 +2069,11 @@ popup (exit 0). With no display there it says so and exits 2, as a window off ev
 cropped to the virtual screen and can't be clicked anyway. Also checked on the owner's Mac (a
 2560x1440-point monitor at -105,-1440 above the built-in display): EA's rect read -210,-2820 to
 4910,0, a double click on its title strip restored it, and the owner found it responsive.
+
+Not sent to Hadron (owner, 2026-11-18: "skip it for now"). On Hadron 0.3.3 as shipped the bug
+never shows at its default 96 DPI: the server maps a point only between two different DPIs, and
+negative-coords passes there on the same monitor. At 192 DPI (set by hand) it fails, and still
+fails with this patch, fde20dcd3b and dff5c30ecc together on 0.3.3's queue (a36db10868 on
+2575f94733), while that same wineserver passes on Gentes' runtime: something else in the fork's
+win32u and winemac patches is needed too, not yet found. A pull request would fix nothing a
+Hadron user sees on its own.
