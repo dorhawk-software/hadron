@@ -1,0 +1,44 @@
+From f7c3d9851edc14dfa62ba0aa923b741e8aa0ffbc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Wed, 18 Nov 2026 07:14:56 +0100
+Subject: [PATCH 80/81] winemac.drv: Keep a minimized window's picture for the
+ Dock.
+
+Windows redraws a window it minimizes at its parked size, 160x31 at
+-32000, and the new small surface's flush replaced the Mac window's
+picture: the Dock showed a blank window with a dash, and the restored
+window came back with it. While the window is minimized, a flush no
+longer changes the Mac window's picture.
+
+Tried with Enterprise Architect: minimized, the Dock shows its window;
+before, a dash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/surface.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/dlls/winemac.drv/surface.c b/dlls/winemac.drv/surface.c
+index bdbcdcdfe6..08d0f32686 100644
+--- a/dlls/winemac.drv/surface.c
++++ b/dlls/winemac.drv/surface.c
+@@ -84,6 +84,16 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
+     CGColorSpaceRef colorspace;
+     CGImageRef image;
+     struct macdrv_win_data *data;
++    BOOL minimized = FALSE;
++
++    /* Windows draws a window it minimized at its small parked size. The Mac window keeps the
++     * picture it had: the Dock shows it, and it comes back with the window. */
++    if ((data = get_win_data(window_surface->hwnd)))
++    {
++        minimized = data->minimized;
++        release_win_data(data);
++    }
++    if (minimized) return TRUE;
+ 
+     colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+     image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
+-- 
+2.56.1
+

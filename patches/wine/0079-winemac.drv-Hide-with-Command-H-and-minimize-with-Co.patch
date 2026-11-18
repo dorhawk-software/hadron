@@ -1,0 +1,151 @@
+From 1e3bdf7709019bc98699487a1f6c3b7bac0967db Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Wed, 18 Nov 2026 07:14:56 +0100
+Subject: [PATCH 79/81] winemac.drv: Hide with Command-H and minimize with
+ Command-M when Command is Ctrl.
+
+As Command-Q does since the last change: with LeftCommandIsCtrl or
+RightCommandIsCtrl, Hide and Minimize take the Mac's Command-H and
+Command-M instead of the keys reaching the program as Ctrl-H and Ctrl-M.
+A window that draws its own frame is borderless to Cocoa, so it has no
+minimize button and Cocoa refused Window > Minimize for it; such a
+window now keeps its WS_MINIMIZEBOX as minimize_button (it adds no
+Cocoa button), and Minimize asks Windows to minimize it, as the app's
+own minimize box does.
+
+Tried with Enterprise Architect (its own frame): Command-H hides it,
+Command-M sends it to the Dock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/cocoa_app.m    | 14 ++++++++------
+ dlls/winemac.drv/cocoa_window.m | 18 +++++++++++++++++-
+ dlls/winemac.drv/window.c       |  2 ++
+ 3 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 4615b9b7d2..71da3f1dc2 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -230,6 +230,7 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             NSString* bundleName;
+             NSString* title;
+             NSMenuItem* item;
++            BOOL mac_keys;
+ 
+             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+ 
+@@ -243,6 +244,10 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             }
+ 
+             mainMenu = [[[NSMenu alloc] init] autorelease];
++            /* With Command as Ctrl, the Mac's own Command keys (Quit, Hide, Minimize) work as in
++               every Mac app instead of reaching the program as Ctrl keys; otherwise they stay
++               free for the program's Alt keys. */
++            mac_keys = left_command_is_ctrl || right_command_is_ctrl;
+ 
+             // Application menu
+             submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINE)] autorelease];
+@@ -252,7 +257,7 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+                 title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), bundleName];
+             else
+                 title = WineLocalizedString(STRING_MENU_ITEM_HIDE);
+-            item = [submenu addItemWithTitle:title action:@selector(hide:) keyEquivalent:@""];
++            item = [submenu addItemWithTitle:title action:@selector(hide:) keyEquivalent:mac_keys ? @"h" : @""];
+ 
+             item = [submenu addItemWithTitle:WineLocalizedString(STRING_MENU_ITEM_HIDE_OTHERS)
+                                       action:@selector(hideOtherApplications:)
+@@ -270,10 +275,7 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             else
+                 title = WineLocalizedString(STRING_MENU_ITEM_QUIT);
+             item = [submenu addItemWithTitle:title action:@selector(terminate:) keyEquivalent:@"q"];
+-            /* With Command as Ctrl, Command-Q quits as in every Mac app instead of reaching the
+-               program as Ctrl-Q, which most Windows programs ignore; otherwise it stays free for
+-               the program's Alt-Q. */
+-            if (left_command_is_ctrl || right_command_is_ctrl)
++            if (mac_keys)
+                 [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
+             else
+                 [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+@@ -286,7 +288,7 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINDOW)] autorelease];
+             [submenu addItemWithTitle:WineLocalizedString(STRING_MENU_ITEM_MINIMIZE)
+                                action:@selector(performMiniaturize:)
+-                        keyEquivalent:@""];
++                        keyEquivalent:mac_keys ? @"m" : @""];
+             [submenu addItemWithTitle:WineLocalizedString(STRING_MENU_ITEM_ZOOM)
+                                action:@selector(performZoom:)
+                         keyEquivalent:@""];
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 3f70d11d8b..733d6d7f58 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -301,6 +301,7 @@ @interface WineWindow ()
+ 
+ @property (assign, nonatomic) void* himc;
+ @property (nonatomic) BOOL commandDone;
++@property (nonatomic) BOOL minimizeBox;
+ 
+ @property (readonly, copy, nonatomic) NSArray* childWineWindows;
+ 
+@@ -959,7 +960,7 @@ @implementation WineWindow
+     @synthesize minimizeAwaitingStart;
+     @synthesize shapeChangedSinceLastDraw;
+     @synthesize usePerPixelAlpha;
+-    @synthesize himc, commandDone;
++    @synthesize himc, commandDone, minimizeBox;
+     @synthesize contentViewMaskLayer;
+ 
+     + (WineWindow*) createWindowWithFeatures:(const struct macdrv_window_features*)wf
+@@ -1179,6 +1180,7 @@ - (void) setWindowFeatures:(const struct macdrv_window_features*)wf
+         NSUInteger newStyle = style_mask_for_features(wf) | (currentStyle & ~usedStyles);
+ 
+         self.preventsAppActivation = wf->prevents_app_activation;
++        self.minimizeBox = wf->minimize_button;
+ 
+         if (newStyle != currentStyle)
+         {
+@@ -2451,6 +2453,10 @@ - (BOOL) validateMenuItem:(NSMenuItem *)menuItem
+             ret = [self isKeyWindow] || (!self.disabled && !self.noForeground);
+         if ([menuItem action] == @selector(toggleFullScreen:) && (self.disabled || maximized))
+             ret = NO;
++        /* A window that draws its own frame has no Cocoa minimize button, but the app's own
++           minimize box is enough for Window > Minimize. */
++        if ([menuItem action] == @selector(performMiniaturize:) && !(self.styleMask & NSWindowStyleMaskTitled))
++            ret = self.minimizeBox && !self.disabled;
+ 
+         return ret;
+     }
+@@ -2565,6 +2571,16 @@ - (void) sendEvent:(NSEvent*)event
+         }
+     }
+ 
++    - (void) performMiniaturize:(id)sender
++    {
++        if (self.styleMask & NSWindowStyleMaskTitled)
++            [super performMiniaturize:sender];
++        else if (self.minimizeBox && !self.disabled)
++            [self miniaturize:sender];
++        else
++            NSBeep();
++    }
++
+     - (void) miniaturize:(id)sender
+     {
+         /* When Stage Manager is enabled, miniaturize: just moves the app/window to
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 3c59bad5bb..ba39751f80 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -140,6 +140,8 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
+          * (WM_NCHITTEST); resizable lets window tools resize it through Accessibility. */
+         if ((style & WS_THICKFRAME) && (!data->shaped || region_covers_window(data->hwnd)))
+             wf.resizable = TRUE;
++        /* Its minimize box is the app's to draw, but Window > Minimize still asks for it. */
++        if (style & WS_MINIMIZEBOX) wf.minimize_button = TRUE;
+         return wf;
+     }
+ 
+-- 
+2.56.1
+

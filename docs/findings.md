@@ -2025,3 +2025,29 @@ processor are ARM64X builds.
 EA's print preview and print dialog work.
 
 Open: images with transparency print on black in EA's print preview (seen, not yet looked into).
+
+## Command keys, minimize and the Dock (fixed, Gentes fork, patches 0078 to 0081)
+
+With Command as Ctrl (`LeftCommandIsCtrl`, `RightCommandIsCtrl`), Command-Q, Command-H and
+Command-M reached the program as Ctrl keys, which Enterprise Architect ignores; Wine keeps Quit on
+Option-Command-Q. With the option they now quit, hide and minimize, as in every Mac app (patches
+0078, 0079). A window that draws its own frame is borderless to Cocoa, so Cocoa refused Window >
+Minimize for it; it now keeps the app's minimize box, and Minimize asks Windows to minimize it.
+
+Minimized, EA showed in the Dock as a blank window with a dash, and came back from the Dock at
+twice the screen's size, no longer maximized. Two causes, found with `WINEDEBUG=+macdrv,+win`:
+
+- Windows redraws a minimized window at its parked size (160x31 at -32000), and the flush of
+  that small surface replaced the Mac window's picture. While minimized, a flush now leaves the
+  picture as it was (patch 0080).
+- On a restore from the Dock, the driver's ShowWindow returns the Cocoa frame in raw coordinates
+  (as winex11's does from its window manager), and win32u's `show_window` gave it to SetWindowPos,
+  which takes the thread's: a DPI-unaware program on a 2x display restored at (0,132)-(5144,4228)
+  instead of (0,66)-(3456,2114). A rect the driver changed for a window that isn't minimized is
+  now mapped from raw to the thread's DPI (patch 0081).
+
+Tried by the owner with EA on a Retina display: Command-H hides it, Command-M puts it in the Dock
+with its picture, and a click on it brings it back maximized; the trace shows the same frame
+before and after. Not covered by a test: the restore that went wrong comes from the Dock, which a
+probe can't click; `WM_SYSCOMMAND` SC_MINIMIZE then SC_RESTORE from inside Windows restored
+correctly before the fix too.

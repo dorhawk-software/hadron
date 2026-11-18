@@ -1,0 +1,62 @@
+From 46753aab4bf714161f66eb67082e31c630eb4d6f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Wed, 18 Nov 2026 07:14:56 +0100
+Subject: [PATCH 81/81] win32u: Map a driver's restore rect from raw
+ coordinates.
+
+When a window is restored by the window manager (the Mac's Dock, an X11
+window manager), the driver's ShowWindow replaces the rect with the
+window manager's frame, in raw coordinates as the driver's own window
+rects are; show_window passes it to SetWindowPos, which takes the
+thread's. On a display scaled 2x, Enterprise Architect (DPI unaware)
+restored from the Dock at (0,132)-(5144,4228), twice the screen, and
+lost its maximized state. A rect the driver changed for a window that
+isn't minimized is now mapped from raw to the thread's DPI.
+
+Traced with Enterprise Architect: before minimizing, its Mac frame was
+(0,66)-(3456,2114); restored from the Dock, (0,132)-(5144,4228) before
+and (0,66)-(3456,2114) after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/win32u/window.c | 21 +++++++++++++++------
+ 1 file changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 8f65d15d39..bc75d5f9d6 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -5098,15 +5098,24 @@ static BOOL show_window( HWND hwnd, INT cmd )
+     }
+ 
+     if (IsRectEmpty( &newPos )) new_swp = swp;
+-    else if ((new_swp = user_driver->pShowWindow( hwnd, cmd, &newPos, swp )) == ~0)
++    else
+     {
+-        if (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD) new_swp = swp;
+-        else if (is_iconic( hwnd ) && (newPos.left != -32000 || newPos.top != -32000))
++        RECT asked = newPos;
++
++        if ((new_swp = user_driver->pShowWindow( hwnd, cmd, &newPos, swp )) == ~0)
+         {
+-            OffsetRect( &newPos, -32000 - newPos.left, -32000 - newPos.top );
+-            new_swp = swp & ~(SWP_NOMOVE | SWP_NOCLIENTMOVE);
++            if (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD) new_swp = swp;
++            else if (is_iconic( hwnd ) && (newPos.left != -32000 || newPos.top != -32000))
++            {
++                OffsetRect( &newPos, -32000 - newPos.left, -32000 - newPos.top );
++                new_swp = swp & ~(SWP_NOMOVE | SWP_NOCLIENTMOVE);
++            }
++            else new_swp = swp;
+         }
+-        else new_swp = swp;
++        /* A driver that takes the window manager's rect for a window being restored gives it in
++         * raw coordinates, as its own window rects are; SetWindowPos below takes the thread's. */
++        else if (!is_iconic( hwnd ) && !EqualRect( &asked, &newPos ))
++            newPos = map_rect_raw_to_virt( newPos, get_thread_dpi() );
+     }
+     swp = new_swp;
+ 
+-- 
+2.56.1
+
