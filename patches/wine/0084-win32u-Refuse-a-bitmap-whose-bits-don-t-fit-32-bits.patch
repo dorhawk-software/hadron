@@ -1,0 +1,60 @@
+From f671e4e6bf9fc805fb765a29e407fb2520d4515f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ond=C5=99ej=20=C5=A0imon?= <ondrej@dorhawk.software>
+Date: Tue, 24 Nov 2026 13:24:42 +0100
+Subject: [PATCH] win32u: Refuse a bitmap whose bits don't fit 32 bits.
+
+FileZilla quit when a site was deleted in its Site Manager. wxWidgets
+asks SHGetStockIconInfo for the question icon with SHGSI_SYSICONINDEX;
+Wine's stub answers shell32.dll with icon -1, and wx then extracts it
+at size -1, which reaches CreateIconFromResourceEx as 65535 x 65535.
+
+NtGdiCreateBitmap computed the size of the bits as INT * INT. At
+65535 x 65535 x 32 bpp that overflows, which C leaves undefined, and
+clang dropped the dib_stride != size / height check that followed. The
+bitmap was made (16 GiB), drawing the icon into it faulted inside
+NtUserGetIconInfo with the USER lock held, and the next CreateWindow
+(the confirmation dialog) asserted on the held lock.
+
+The size is now computed in SIZE_T, and bits that don't fit 32 bits
+fail with ERROR_NOT_ENOUGH_MEMORY, as Windows XP does (gdi32's
+test_bitmap accepts it).
+
+Tested with a program that creates a 65535 x 65535 bitmap, extracts
+shell32's icon at size -1 and then creates a window: before, the bitmap
+was made and the window's creation hit "BUG: holding USER lock" (exit
+1); after, the bitmap is refused with error 8, the icon is NULL and the
+window is made (exit 0). FileZilla 3.72.1 then showed its "Do you
+really want to delete the selected entries?" question instead of
+quitting.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/win32u/bitmap.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/win32u/bitmap.c b/dlls/win32u/bitmap.c
+index 97b5cf9f7c..f872576508 100644
+--- a/dlls/win32u/bitmap.c
++++ b/dlls/win32u/bitmap.c
+@@ -275,11 +275,14 @@ HBITMAP WINAPI NtGdiCreateBitmap( INT width, INT height, UINT planes,
+     }
+ 
+     dib_stride = get_dib_stride( width, bpp );
+-    size = dib_stride * height;
+-    /* Check for overflow (dib_stride itself must be ok because of the constraint on bm.bmWidth above). */
+-    if (dib_stride != size / height)
++    /* In 64 bits: as two INTs the product overflowed, which C leaves undefined, and the check
++     * that followed was compiled away, so a 65535 x 65535 icon (16 GiB at 32 bpp) was created
++     * and drawing into it faulted with the USER lock held. Bits that don't fit 32 bits fail
++     * as not enough memory, as XP does (see test_bitmap in gdi32's tests). */
++    size = (SIZE_T)dib_stride * height;
++    if (size > 0xffffffff)
+     {
+-        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+         return 0;
+     }
+ 
+-- 
+2.56.1
+
